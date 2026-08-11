@@ -39,16 +39,6 @@ menu "ADPCM Streamer Configuration"
             default 44100 if STREAMER_SAMPLE_RATE_44100
             default 48000 if STREAMER_SAMPLE_RATE_48K
 
-        config STREAMER_SAMPLE_RATE_ENUM
-            int
-            default 0 if STREAMER_SAMPLE_RATE_8K
-            default 1 if STREAMER_SAMPLE_RATE_11025
-            default 2 if STREAMER_SAMPLE_RATE_16K
-            default 3 if STREAMER_SAMPLE_RATE_22050
-            default 4 if STREAMER_SAMPLE_RATE_32K
-            default 5 if STREAMER_SAMPLE_RATE_44100
-            default 6 if STREAMER_SAMPLE_RATE_48K
-
         choice STREAMER_I2S_BITS_PER_SAMPLE
             prompt "I2S bits per sample"
             default STREAMER_I2S_BITS_24
@@ -115,13 +105,9 @@ menu "ADPCM Streamer Configuration"
             prompt "Audio codec (PCM or ADPCM)"
             default STREAMER_CODEC_ADPCM
             help
-                Select the audio codec used for streaming.
-                ADPCM: DVI4 IMA ADPCM, 4 bits/sample (32 kbps @ 16kHz).
-                       Low bandwidth, requires encoding (CPU).
-                PCM:   Raw 16-bit or 24-bit signed PCM, no compression.
-                       High bandwidth (768 kbps @ 16kHz/16-bit/stereo),
-                       but zero CPU overhead for encoding.
-                Adjustable at runtime via AT+CODEC=0|1.
+                ADPCM: DVI4 IMA, 4 bits/sample (32 kbps @ 16kHz), ~10% CPU.
+                PCM: raw 16/24-bit signed, no compression (1536 kbps @ 48kHz/16-bit/stereo).
+                Runtime: AT+CODEC=0|1.
 
         config STREAMER_CODEC_ADPCM
             bool "ADPCM (DVI4 IMA, 4 bits/sample)"
@@ -135,13 +121,12 @@ menu "ADPCM Streamer Configuration"
             default 1 if STREAMER_CODEC_PCM
 
         choice STREAMER_AUDIO_GAIN
-            prompt "Digital gain (24-bit mode)"
+            prompt "Digital gain"
             default STREAMER_GAIN_32
             help
-                Digital gain applied to 24-bit samples before TPDF dither.
+                Digital gain applied before TPDF dither (both 16-bit and 24-bit).
                 Compensates for INMP441 low sensitivity (-26 dBFS @ 94 dB SPL).
-                Applied after >>8 extraction, before 24->16 dither reduction.
-                Adjustable at runtime via AT+GAIN (0-64).
+                Runtime: AT+GAIN (0-64).
 
         config STREAMER_GAIN_BYPASS
             bool "Bypass (no gain, 0x)"
@@ -150,7 +135,7 @@ menu "ADPCM Streamer Configuration"
         config STREAMER_GAIN_16
             bool "+24 dB (16x)"
         config STREAMER_GAIN_32
-            bool "+30 dB (32x) — default"
+            bool "+30 dB (32x) - default"
         config STREAMER_GAIN_48
             bool "+34 dB (48x)"
         config STREAMER_GAIN_64
@@ -170,9 +155,8 @@ menu "ADPCM Streamer Configuration"
             prompt "AGC mode (preset)"
             default STREAMER_AGC_VOICE_BALANCED
             help
-                AGC (Automatic Gain Control) preset. Each preset has its own
-                attack/release speeds, target level, and noise gate threshold.
-                Adjustable at runtime via AT+AGC=0..8.
+                AGC preset - attack/release speeds, target level, noise gate.
+                Runtime: AT+AGC=0..8.
 
         config STREAMER_AGC_OFF
             bool "OFF (use fixed gain)"
@@ -187,7 +171,7 @@ menu "ADPCM Streamer Configuration"
         config STREAMER_AGC_NOISY_ROOM
             bool "Noisy Room (high noise gate, cuts background)"
         config STREAMER_AGC_MUSIC
-            bool "Music (slow attack, fast release — no transient squash)"
+            bool "Music (slow attack, fast release - no transient squash)"
         config STREAMER_AGC_LIMITER
             bool "Limiter (peak limiting only, no quiet boost)"
         config STREAMER_AGC_SURVEILLANCE
@@ -216,13 +200,10 @@ menu "ADPCM Streamer Configuration"
         prompt "Audio transport mode"
         default STREAMER_TRANSPORT_UDP
         help
-            Transport for the audio stream from ESP to the receiver.
-              UDP:    Classic datagram, no delivery/order guarantees.
-              TCP:    ESP = listener (server connects to ESP). Framing
-                      [u16 len][pkt 16B][payload]. Guaranteed delivery and
-                      order, at the cost of slightly higher latency.
-              RawTX:  Broadcast raw WiFi frames (receiver in monitor mode).
-            Switchable at runtime via AT+XPORT=0|1|2 (requires HOTRESTART).
+            UDP: classic datagram, no delivery/order guarantees.
+            TCP: ESP = listener (server connects), framing [u16 len][hdr 16B][payload].
+            RawTX: broadcast raw WiFi frames (receiver in monitor mode).
+            Runtime: AT+XPORT=0|1|2 (requires HOTRESTART or RST).
 
     config STREAMER_TRANSPORT_UDP
         bool "UDP (default)"
@@ -238,20 +219,14 @@ menu "ADPCM Streamer Configuration"
         default 1 if STREAMER_TRANSPORT_TCP
         default 2 if STREAMER_TRANSPORT_RAWTX
 
- 
-   config STREAMER_RAWTX_CHANNEL
-            int "WiFi channel for Raw 802.11 TX mode (1-13)"
-            range 1 13
-            default 1
-            help
-                The WiFi channel (frequency) used for broadcasting audio
-                when Raw 802.11 TX transport is selected (STREAMER_TRANSPORT_RAWTX).
-                1-13 are valid for 2.4 GHz.
-                The receiver must be set to the same channel in Monitor Mode.
-                Adjustable at runtime via AT+WCH=1..13 (requires HOTRESTART).
-
-
-
+    config STREAMER_RAWTX_CHANNEL
+        int "WiFi channel for Raw 802.11 TX mode (1-14)"
+        range 1 14
+        default 1
+        help
+            WiFi channel for RawTX broadcasts (2.4 GHz).
+            Receiver must use the same channel in Monitor Mode.
+            Runtime: AT+WCH=1..14 (HOTRESTART to apply).
 
 
     # ===================================================================
@@ -264,27 +239,23 @@ menu "ADPCM Streamer Configuration"
             default 0
             range 0 3
             help
-                Delay of the DATA (SD) signal relative to BCK, in APB clock
-                cycles (12.5 ns at 80 MHz). Register I2S.timing.rx_sd_in_delay.
-                0 = no delay (default, suitable for INMP441 on short wires).
+                Delay of DATA (SD) relative to BCK, in APB clock cycles (12.5 ns @ 80 MHz).
+                0 = no delay (default for INMP441 on short wires).
                 1..3 = skew compensation for long wires or unusual PCB layout.
-                Adjustable at runtime via AT+TIMING=sd,ws,bck.
 
         config STREAMER_I2S_TIMING_WS_DELAY
             int "I2S RX WS input delay (0..3)"
             default 0
             range 0 3
             help
-                Delay of the WS signal relative to BCK. Register
-                I2S.timing.rx_ws_in_delay. See SD_DELAY help.
+                Delay of the WS signal relative to BCK. See SD_DELAY help.
 
         config STREAMER_I2S_TIMING_BCK_DELAY
             int "I2S RX BCK input delay (0..3)"
             default 0
             range 0 3
             help
-                Delay of the BCK signal. Register I2S.timing.rx_bck_in_delay.
-                See SD_DELAY help.
+                Delay of the BCK signal. See SD_DELAY help.
     endmenu
 
     # ===================================================================
@@ -292,21 +263,14 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "Battery Monitoring"
-        # Ported from ESP8285-WEBSERVER project (https://github.com/Dzantemir/ESP8285-WEBSERVER)
 
         config STREAMER_BATTERY_ENABLED
             bool "Enable battery monitoring"
             default n
             help
                 Enable battery voltage monitoring via ESP8266 ADC (TOUT pin).
-                Requires an external voltage divider on the battery side to
-                scale V_batt into the ADC's 0-1V range. When enabled:
-                - ADC is initialized at startup
-                - A background task checks V_batt every BATT_CHECK_MIN minutes
-                - If V_batt drops below BATT_CRITICAL_MV, device enters deep
-                  sleep to preserve battery (wakes after BATT_SLEEP_MIN min).
-                When disabled, all battery code is excluded (zero overhead).
-                AT+BATT command still works, returns 0.
+                Requires an external voltage divider scaling V_batt into 0-1V.
+                Below BATT_CRITICAL_MV -> deep sleep (BATT_SLEEP_MIN min).
 
         config STREAMER_BATT_CRITICAL_MV
             int "Critical battery voltage (mV)"
@@ -314,7 +278,7 @@ menu "ADPCM Streamer Configuration"
             range 3000 4200
             default 3700
             help
-                Below this voltage → deep sleep to protect battery.
+                Below this voltage -> deep sleep to protect battery.
                 Li-Ion: 3700 mV = ~20% charge (safe cutoff).
 
         config STREAMER_BATT_START_MV
@@ -324,7 +288,7 @@ menu "ADPCM Streamer Configuration"
             default 3900
             help
                 Minimum battery voltage for normal startup.
-                Below this on boot → immediate deep sleep.
+                Below this on boot -> immediate deep sleep.
 
         config STREAMER_BATT_BAD_MV
             int "Invalid reading threshold (mV)"
@@ -333,7 +297,7 @@ menu "ADPCM Streamer Configuration"
             default 2500
             help
                 Below this, ADC reading is considered erroneous (no battery,
-                broken divider). Does NOT trigger deep sleep — just logs warning.
+                broken divider). Does NOT trigger deep sleep - just logs warning.
 
         config STREAMER_BATT_DIVIDER_RATIO
             int "Voltage divider ratio (x1)"
@@ -341,11 +305,8 @@ menu "ADPCM Streamer Configuration"
             range 1000 20000
             default 5711
             help
-                Voltage divider coefficient. Formula:
-                V_batt_mV = (ADC_raw × RATIO) / 1024.
-                For R1=100k, R2=33k divider → 5711.
-                For R1=220k, R2=100k divider → 4674.
-                Calibrate with a multimeter for accuracy.
+                Voltage divider coefficient. Formula: V_batt_mV = (ADC_raw × RATIO) / 1024.
+                R1=100k, R2=33k -> 5711. R1=220k, R2=100k -> 4674. Calibrate with multimeter.
 
         config STREAMER_BATT_ADC_SAMPLES
             int "ADC sample count"
@@ -353,8 +314,7 @@ menu "ADPCM Streamer Configuration"
             range 1 50
             default 15
             help
-                Number of ADC readings to average. More = more stable
-                reading, slower measurement (~50ms per sample).
+                Number of ADC readings to average. More = more stable, slower (~50ms per sample).
 
         config STREAMER_BATT_ADC_DELAY_MS
             int "ADC sample interval (ms)"
@@ -407,23 +367,20 @@ menu "ADPCM Streamer Configuration"
             string "Default WiFi SSID"
             default "YOUR_WIFI_SSID"
             help
-                Default WiFi network name. Can be changed at runtime
-                via AT+WIFI=ssid,password (auto-saved to NVS).
+                Default WiFi network name. Runtime: AT+WIFI=ssid,password (auto-saved to NVS).
 
         config STREAMER_WIFI_PASSWORD
             string "Default WiFi password"
             default "12345678"
             help
-                Default WiFi password. Can be changed at runtime.
+                Default WiFi password. Runtime: AT+WIFI.
 
         config STREAMER_WIFI_HOSTNAME
             string "WiFi hostname"
             default "esp-streamer"
             help
-                Device hostname on the network. Max 23 characters
-                (stored in a 24-byte field including NUL terminator).
-                If longer, it will be rejected at runtime by AT+HOST
-                and truncated by the config loader at boot.
+                Device hostname on the network. Max 23 characters (24-byte field w/ NUL).
+                Rejected at runtime by AT+HOST if longer; truncated by the config loader at boot.
 
         config STREAMER_WIFI_CONNECT_TIMEOUT_MS
             int "WiFi connection timeout (ms)"
@@ -440,12 +397,8 @@ menu "ADPCM Streamer Configuration"
             range 1000 120000
             default 15000
             help
-              FIX (DHCP wedged bug): lowered from 30000 to 15000. Long backoff
-              cycles (30s) increase the window in which the lwIP DHCP client
-              can get wedged after the AP returns. 15s is enough to avoid
-              hammering the AP during brief drops while keeping the zombie-state
-              window small. The IP watchdog (wifi_sta.c) catches the remaining
-              cases where DHCP still hangs despite the shorter backoff.
+                Lowered from 30000 to 15000 to shrink the DHCP-wedge window
+                (long backoff cycles increase the chance of lwIP DHCP client wedging).
 
     endmenu
 
@@ -459,16 +412,10 @@ menu "ADPCM Streamer Configuration"
             bool "Enable WiFi boot retry with deep sleep"
             default y
             help
-                On boot (after reset or power-on), try to connect to the AP
-                multiple times. If all attempts fail, enter deep sleep for
-                a configurable duration, then reboot and try again. This
-                prevents the ESP from hanging in a zombie state when the AP
-                is unreachable (power outage, AP reboot, out of range).
-                Only applies to UDP (transport=0) and TCP (transport=1).
-                RawTX (transport=2) doesn't use AP association - skipped.
-                NOTE: deep sleep on ESP8266 requires GPIO16 (XPD_DCDC)
-                connected to RST. If your board doesn't have this wiring,
-                use "soft sleep" mode (vTaskDelay) instead.
+                On boot, try connecting to the AP multiple times. If all fail,
+                enter deep sleep for a configurable duration, then reboot and retry.
+                Only applies to UDP/TCP transports (RawTX skips AP association).
+                NOTE: deep sleep on ESP8266 requires GPIO16 (XPD_DCDC) to RST.
 
         config STREAMER_WIFI_BOOT_RETRY_ATTEMPTS
             int "Number of WiFi connection attempts before sleep"
@@ -476,8 +423,7 @@ menu "ADPCM Streamer Configuration"
             default 3
             depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
             help
-                How many times to try connecting to the AP before giving up
-                and entering sleep. Each attempt waits WIFI_CONNECT_TIMEOUT_MS
+                Connection attempts before giving up. Each waits WIFI_CONNECT_TIMEOUT_MS
                 (default 15s). 3 attempts = ~45s total before sleep.
 
         config STREAMER_WIFI_BOOT_SLEEP_MINUTES
@@ -486,22 +432,19 @@ menu "ADPCM Streamer Configuration"
             default 2
             depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
             help
-                How long to sleep before rebooting and retrying WiFi.
-                1-2 minutes is short enough for quick recovery when the AP
-                comes back. Increase to save power on battery.
+                Sleep duration before reboot-and-retry. 1-2 min for quick recovery;
+                increase to save power on battery.
 
         config STREAMER_WIFI_BOOT_SLEEP_MODE
             int "Sleep mode (0=deep sleep, 1=soft sleep vTaskDelay)"
             range 0 1
-            default 0
+            default 1
             depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
             help
-                0 = Deep sleep (esp_deep_sleep): lowest power, requires
-                    GPIO16 connected to RST. On wake, the ESP reboots
-                    (runs app_main from scratch).
-                1 = Soft sleep (vTaskDelay): works without hardware mod,
-                    but uses more power. After the delay, WiFi reconnect
-                    is retried in-place (no reboot).
+                0 = Deep sleep (esp_deep_sleep): lowest power, requires GPIO16->RST.
+                    On wake, ESP reboots (runs app_main from scratch).
+                1 = Soft sleep (vTaskDelay): no hardware mod, more power.
+                    WiFi reconnect retried in-place (no reboot).
 
     endmenu
 
@@ -510,7 +453,7 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "Service Port (EASSP)"
- 
+
         config STREAMER_SVC_PORT
             int "EASSP service port"
             range 1 65535
@@ -530,10 +473,9 @@ menu "ADPCM Streamer Configuration"
             bool "Enable broadcast announcements when idle"
             default y
             help
-                When enabled, the ESP broadcasts INFO packets every 1-5s
-                while idle, allowing servers to discover it automatically.
-                Disable only for security-sensitive deployments where the
-                server must know the device IP in advance.
+                ESP broadcasts INFO packets every 1-5s while idle, allowing servers
+                to discover it automatically. Disable only for security-sensitive
+                deployments where the server must know the device IP in advance.
 
         config STREAMER_SVC_ANNOUNCE_MIN_MS
             int "Minimum announce interval (ms)"
@@ -570,7 +512,7 @@ menu "ADPCM Streamer Configuration"
             range 1 15
             default 5
             help
-                MUST be highest priority — DMA buffers overflow if starved.
+                MUST be highest priority - DMA buffers overflow if starved.
 
         config STREAMER_TASK_PRIO_ADPCM
             int "ADPCM encoder task priority"
@@ -597,11 +539,8 @@ menu "ADPCM Streamer Configuration"
             range 1 15
             default 4
             help
-                Priority of the background accept() task (accepts incoming
-                TCP connections from the server). Must be lower than I2S (5),
-                but higher than or equal to UDP/SVC (2) to react quickly to
-                a new connect after a connection drop.
-
+                Priority of the background accept() task. Lower than I2S (5),
+                higher than or equal to UDP/SVC (2) to react quickly to new connects.
 
         config STREAMER_TASK_STACK_I2S
             int "I2S task stack size (bytes)"
@@ -633,33 +572,26 @@ menu "ADPCM Streamer Configuration"
             default 1024
             range 512 2048
             help
-                Stack size for the background accept() task. 1024 is enough
-                for accept + setsockopt + logging. Increase if extended
-                diagnostics are needed.
+                Stack for the background accept() task. 1024 is enough for
+                accept + setsockopt + logging.
 
         config STREAMER_STREAM_STOP_TIMEOUT_UDP_MS
             int "Stream stop timeout for UDP transport (ms)"
             range 1000 10000
             default 3000
             help
-                Max wait for the UDP stream_task_fn to exit when stop_streaming
-                is called. Must be > UDP_SEND_TIMEOUT_MS so that a task
-                blocked in sendto() has time to return. With a smaller value,
-                the task gets force-deleted while inside lwIP sendto() -
-                corrupting state and orphaning mutexes -> deadlock on next
-                start_streaming().
+                Max wait for the UDP stream_task_fn to exit on stop_streaming.
+                Must be > UDP_SEND_TIMEOUT_MS so a task blocked in sendto() can
+                return - force-deleting it corrupts lwIP state.
 
         config STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
             int "Stream stop timeout for TCP transport (ms)"
             range 1000 15000
             default 3000
             help
-                Max wait for the TCP stream_task_fn to exit when stop_streaming
-                is called. Must be > TCP_SEND_TIMEOUT_MS so that a task
-                blocked in send() has time to return. With a smaller value,
-                the task gets force-deleted while inside lwIP send() -
-                corrupting state and orphaning mutexes -> deadlock on next
-                start_streaming().
+                Max wait for the TCP stream_task_fn to exit on stop_streaming.
+                Must be > TCP_SEND_TIMEOUT_MS so a task blocked in send() can
+                return - force-deleting it corrupts lwIP state.
 
     endmenu
 
@@ -687,44 +619,50 @@ menu "ADPCM Streamer Configuration"
 
     menu "Network / UDP / TCP"
 
+        config STREAMER_UDP_RECEIVE_TIMEOUT_MS_ENABLED
+            bool "Enable UDP socket receive timeout"
+            default n
+
+        config STREAMER_UDP_RECEIVE_TIMEOUT_MS
+            int "UDP socket receive timeout (ms)"
+            range 500 2000
+            default 2000
+            depends on STREAMER_UDP_RECEIVE_TIMEOUT_MS_ENABLED
+
+        config STREAMER_UDP_SEND_TIMEOUT_MS_ENABLED
+            bool "Enable UDP socket send timeout"
+            default n
+
         config STREAMER_UDP_SEND_TIMEOUT_MS
             int "UDP socket send timeout (ms)"
             range 500 2000
             default 2000
+            depends on STREAMER_UDP_SEND_TIMEOUT_MS_ENABLED
+
+        config STREAMER_TCP_SEND_TIMEOUT_MS_ENABLED
+            bool "Enable TCP socket send timeout"
+            default y
 
         config STREAMER_TCP_SEND_TIMEOUT_MS
-            int "TCP send timeout (ms)"
+            int "TCP socket send timeout (ms)"
             default 2000
             range 500 10000
-            help
-                Timeout for the blocking send() call, in milliseconds. If the
-                receiver does not read data for longer than this, the connection
-                is closed (the accept task picks up a new connect).
-                  LAN / good WiFi: 1000-2000 ms (fast reconnect)
-                  Poor WiFi: 3000-5000 ms (give TCP a chance to retransmit)
-                Too low → frequent disconnects on jitter.
-                Too high → pipeline stalls on connection drop.
+            depends on STREAMER_TCP_SEND_TIMEOUT_MS_ENABLED
 
         config STREAMER_TCP_NODELAY_ENABLED
             bool "Enable TCP_NODELAY (disable Nagle algorithm)"
             default y
             help
-                Sets TCP_NODELAY on client sockets to disable Nagle's algorithm.
-                With Nagle (default), TCP coalesces small writes into larger
-                segments, adding up to ~40ms latency. For low-latency audio
-                (20ms frames), this is critical — each frame must be sent
-                immediately, not batched.
-                Recommended: ON. Disable only for debugging or if the server
-                has issues with small packets.
+                Sets TCP_NODELAY on client sockets. With Nagle (default), TCP coalesces
+                small writes into larger segments, adding ~40ms latency. For low-latency
+                audio (20ms frames), each frame must be sent immediately. Recommended: ON.
 
         config STREAMER_TCP_KEEPALIVE_ENABLED
             bool "Enable TCP keepalive on client sockets"
             default y
             help
                 Sends periodic TCP keepalive probes to detect dead connections
-                (crashed server, WiFi drop without FIN). Without keepalive, a
-                dead peer stays ESTABLISHED forever if no send() is attempted.
-                Recommended: ON for streaming.
+                (crashed server, WiFi drop without FIN). Recommended: ON for streaming.
 
         config STREAMER_TCP_KEEPIDLE
             int "TCP keepalive idle (seconds before first probe)"
@@ -732,9 +670,8 @@ menu "ADPCM Streamer Configuration"
             default 10
             depends on STREAMER_TCP_KEEPALIVE_ENABLED
             help
-                Seconds of idle time before the first keepalive probe is sent.
-                10s detects a dead server quickly (audio pipeline is silent
-                during AGC noise gate, so send() may not fire for a while).
+                Seconds of idle time before the first keepalive probe. 10s detects
+                a dead server quickly (audio may be silent during AGC noise gate).
 
         config STREAMER_TCP_KEEPINTVL
             int "TCP keepalive interval (seconds between probes)"
@@ -750,20 +687,16 @@ menu "ADPCM Streamer Configuration"
             default 3
             depends on STREAMER_TCP_KEEPALIVE_ENABLED
             help
-                Number of consecutive failed keepalive probes before declaring
-                the connection dead. Total detection time ≈ keepidle + keepcnt*keepintvl.
-                Default: 10 + 3*3 = 19 seconds.
+                Failed probes before declaring connection dead.
+                Total detection time ≈ keepidle + keepcnt × keepintvl (default: 19 s).
 
         config STREAMER_TCP_LINGER_ENABLED
             bool "Enable SO_LINGER=0 on client sockets (RST close, skip TIME_WAIT)"
             default y
             help
                 Forces RST close instead of FIN, skipping TIME_WAIT entirely.
-                Prevents heap exhaustion during rapid reconnect cycles (each
-                TIME_WAIT PCB holds ~8KB of pbuf memory on ESP8266 lwIP).
-                Appropriate for streaming audio — we don't care about in-flight
-                data when closing (the next connection restarts the stream
-                with fresh seq numbers).
+                Prevents heap exhaustion during rapid reconnect cycles (each TIME_WAIT
+                PCB holds ~8KB of pbuf memory on ESP8266 lwIP). Appropriate for streaming.
 
     endmenu
 
@@ -777,15 +710,10 @@ menu "ADPCM Streamer Configuration"
             bool "Enable supervisor task (software watchdog)"
             default y
             help
-                A dedicated low-priority task that monitors system health and
-                calls esp_restart() if anything goes wrong. The ESP8266
-                hardware WDT is fed by the IDLE task and only fires when a
-                task hogs the CPU without yielding. The supervisor catches
-                "soft" deadlocks where tasks yield (vTaskDelay, xQueueReceive
-                with timeout, sendto with SO_SNDTIMEO) but no useful work
-                happens — e.g. sendto ENOMEM, deadlocked mutex, heap
-                exhaustion death spiral.
-                Recommended: ON. Disable only for debugging.
+                Low-priority task that monitors system health and calls esp_restart()
+                if anything goes wrong. Catches "soft" deadlocks where tasks yield
+                (vTaskDelay, xQueueReceive, sendto) but no useful work happens.
+                Recommended: ON.
 
         config STREAMER_TASK_STACK_SUPERVISOR
             int "Supervisor task stack size (bytes)"
@@ -799,9 +727,8 @@ menu "ADPCM Streamer Configuration"
             default 1
             depends on STREAMER_SUPERVISOR_ENABLED
             help
-                MUST be low priority (1-2). The supervisor runs when the
-                system is idle — which is exactly when deadlocked tasks are
-                yielding. A high-priority supervisor would preempt useful work.
+                MUST be low priority (1-2). Supervisor runs when the system is idle -
+                a high-priority supervisor would preempt useful work.
 
         config STREAMER_SUPERVISOR_MIN_HEAP
             int "Supervisor minimum free heap (bytes)"
@@ -810,10 +737,7 @@ menu "ADPCM Streamer Configuration"
             depends on STREAMER_SUPERVISOR_ENABLED
             help
                 If free heap drops below this, the supervisor resets the ESP.
-                Normal operation: ~52KB free. After 1 TIME_WAIT leak: ~41KB.
-                After 2: ~30KB. 15KB is the minimum for pools + WiFi + lwIP.
-                Lower = more tolerant (but risk death spiral).
-                Higher = more aggressive (but false resets on peak usage).
+                Normal: ~52KB free. 15KB is the minimum for pools + WiFi + lwIP.
 
         config STREAMER_SUPERVISOR_STALL_TIMEOUT
             int "Supervisor pipeline stall timeout (ms)"
@@ -821,11 +745,8 @@ menu "ADPCM Streamer Configuration"
             default 15000
             depends on STREAMER_SUPERVISOR_ENABLED
             help
-                If streaming is active for this long and neither I2S nor TX
-                counters have advanced since the last check, the pipeline is
-                deadlocked → reset. 15s matches the server's DISCOVER watchdog.
-                Lower = faster recovery (but false resets during slow WiFi).
-                Higher = more tolerant (but longer outage before reset).
+                If streaming is active for this long and neither I2S nor TX counters
+                have advanced since the last check, the pipeline is deadlocked -> reset.
 
         config STREAMER_SUPERVISOR_MIN_STACK
             int "Supervisor minimum free stack (bytes)"
@@ -833,8 +754,7 @@ menu "ADPCM Streamer Configuration"
             default 256
             depends on STREAMER_SUPERVISOR_ENABLED
             help
-                If any pipeline task's stack high-water mark drops below this,
-                reset. 256 bytes is dangerously close to overflow.
+                If any pipeline task's stack high-water mark drops below this, reset.
 
         config STREAMER_SUPERVISOR_CHECK_INTERVAL
             int "Supervisor check interval (ms)"
@@ -842,9 +762,7 @@ menu "ADPCM Streamer Configuration"
             default 2000
             depends on STREAMER_SUPERVISOR_ENABLED
             help
-                How often the supervisor runs its checks. 2s gives fast
-                detection without CPU waste. Lower = faster detection (more
-                CPU). Higher = less CPU (slower detection).
+                How often the supervisor runs its checks. 2s gives fast detection.
 
     endmenu
 

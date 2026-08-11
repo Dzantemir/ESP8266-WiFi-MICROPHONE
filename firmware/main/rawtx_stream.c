@@ -9,14 +9,11 @@
 /* ---- System / SDK includes ---- */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"  /* FIX (AUDIT-HIGH): vTaskDelay() used at line ~53 is declared
-                             * in task.h, not FreeRTOS.h. Currently works only
-                             * via transitive inclusion from esp_wifi.h ->
-                             * esp_event.h -> task.h - fragile build dependency. */
 #include "esp_wifi.h"
 #include "esp_log.h"
 
 /* ---- Project includes ---- */
+#include "board_config.h" 
 #include "rawtx_stream.h"
 
 static const char *TAG = "rawtx";
@@ -39,22 +36,19 @@ static uint8_t s_wifi_hdr[WIFI_HDR_LEN];
  * Incremented per transmitted MSDU to allow receiver dedup. */
 static uint16_t s_wifi_seq = 0;
 
-/* FIX (AUDIT-LOW): s_ready is read by stream_task_fn (via transport_is_ready)
- * from a different task than the one that writes it (rawtx_stream_init/deinit
- * called from main loop). Mark volatile for the same reason as s_running in
- * tcp_stream.c. */
+/* AUDIT-LOW: s_ready is read by stream_task_fn (via transport_is_ready) from
+ * a different task than the one that writes it (rawtx_stream_init/deinit from
+ * main loop). Mark volatile for the same reason as s_running in tcp_stream.c. */
 static volatile bool s_ready = false;
 
-/* FIX (AUDIT-MEDIUM): single source of truth for the payload size cap.
- * Was a magic 1400 duplicated in s_frame_buf declaration and the len check. */
+/* AUDIT-MEDIUM: single source of truth for the payload size cap. Was a magic
+ * 1400 duplicated in s_frame_buf declaration and the len check. */
 #define RAWTX_MAX_PAYLOAD 1400
 
 /* Static frame buffer — single-threaded (only stream_task_fn calls
- * rawtx_stream_send via transport_send), so no mutex needed. Same approach
- * as tcp_stream.c. Avoids per-packet malloc/free which fragments the heap
- * at 66+ allocs/sec (15ms frames) — each alloc churns the ESP8266's small
- * heap and risks fragmentation over long streaming sessions.
- * Max frame = 24 (wifi hdr) + 1400 (payload) = 1424 bytes. */
+ * rawtx_stream_send via transport_send), so no mutex needed. Same approach as
+ * tcp_stream.c. Avoids per-packet malloc/free which fragments the heap at 66+
+ * allocs/sec. Max frame = 24 (wifi hdr) + 1400 (payload) = 1424 bytes. */
 static uint8_t s_frame_buf[WIFI_HDR_LEN + RAWTX_MAX_PAYLOAD];
 
 esp_err_t rawtx_stream_init(void)
@@ -62,7 +56,9 @@ esp_err_t rawtx_stream_init(void)
     if (s_ready)
     {
         rawtx_stream_deinit();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        /* vTaskDelay(50ms) was here — removed: esp_wifi_80211_tx() is
+         * synchronous (copies the frame into the driver's TX pool before
+         * returning), so there is no async cleanup to wait for. */
     }
 
     /* Build 802.11 MAC header for a Data frame sent as an independent
@@ -83,7 +79,7 @@ esp_err_t rawtx_stream_init(void)
      *   addr2 (SA)    = our MAC (so receivers know who sent it)
      *   addr3 (BSSID) = broadcast (we're not in any BSS)
      *
-     * Sequence Control: initialized to 0, incremented per packet in
+     * Sequence Control: starts at 0, incremented per packet in
      * rawtx_stream_send() so receivers can dedup. */
     memset(s_wifi_hdr, 0, sizeof(s_wifi_hdr));
     s_wifi_hdr[0] = 0x08; /* FC byte 0: Data frame (type=2, subtype=0) */
@@ -92,13 +88,10 @@ esp_err_t rawtx_stream_init(void)
     /* addr1 (bytes 4-9): Receiver Address = Broadcast */
     memset(&s_wifi_hdr[4], 0xFF, 6);
 
-    /* addr2 (bytes 10-15): Transmitter Address = our MAC
-     *
-     * FIX (AUDIT-H4): do NOT fall back to a hardcoded MAC. If multiple
-     * devices ever hit this path, they all transmit with the same SA ->
-     * receivers cannot distinguish them, 802.11 dedup by (SA, seq)
-     * collides, and on-air interference results. Fail init instead so
-     * the operator notices. */
+    /* addr2 (bytes 10-15): Transmitter Address = our MAC.
+     * AUDIT-H4: do NOT fall back to a hardcoded MAC. If multiple devices hit
+     * this path, they all transmit with the same SA -> 802.11 dedup by
+     * (SA, seq) collides and on-air interference results. Fail init instead. */
     uint8_t mac[6];
     if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK)
     {
@@ -111,11 +104,11 @@ esp_err_t rawtx_stream_init(void)
     }
 
     /* addr3 (bytes 16-21): BSSID = Broadcast.
-     * For ToDS=0/FromDS=0, addr3 is the BSSID. Since we're not in any
-     * BSS (no AP association), use broadcast - not our MAC. */
+     * For ToDS=0/FromDS=0, addr3 is the BSSID. Since we're not in any BSS,
+     * use broadcast — not our MAC. */
     memset(&s_wifi_hdr[16], 0xFF, 6);
 
-    /* bytes 22-23: Sequence Control - starts at 0, incremented per packet. */
+    /* bytes 22-23: Sequence Control — starts at 0, incremented per packet. */
     s_wifi_seq = 0;
 
     ESP_LOGI(TAG, "Raw 802.11 TX mode active (broadcast, ToDS=0, FromDS=0)");
@@ -137,17 +130,20 @@ bool rawtx_stream_is_ready(void)
 
 esp_err_t rawtx_stream_send(const uint8_t *data, size_t len)
 {
-    if (!data || !len || !s_ready)
+    if (!data || !len)
         return ESP_ERR_INVALID_ARG;
+    /* LOW: !s_ready is a STATE error (transport not initialized), not an
+     * argument error. Returning INVALID_ARG misled callers. */
+    if (!s_ready)
+        return ESP_ERR_INVALID_STATE;
 
     /* Raw 802.11 TX: prepend MAC header and send via esp_wifi_80211_tx.
-     * Buffer: [wifi_hdr 24B][data len bytes]
-     * Uses static s_frame_buf (no per-packet malloc - see comment above). */
-    /* FIX (L11): reject oversized payloads instead of silently truncating.
-     * Silent truncation drops the tail of the audio packet - the receiver
-     * gets a short ADPCM frame and may decode garbage for the missing
-     * nibbles. main.c's MTU guard should prevent this, but a bug there
-     * would be masked here. */
+     * Buffer: [wifi_hdr 24B][data len bytes]. Uses static s_frame_buf
+     * (no per-packet malloc — see comment above). */
+    /* L11: reject oversized payloads instead of silently truncating. Silent
+     * truncation drops the tail of the audio packet — receiver decodes
+     * garbage. main.c's MTU guard should prevent this, but a bug there would
+     * be masked here. */
     if (len > RAWTX_MAX_PAYLOAD)
     {
         ESP_LOGW(TAG, "payload %u > %u, rejecting",
@@ -163,41 +159,34 @@ esp_err_t rawtx_stream_send(const uint8_t *data, size_t len)
      * Layout (little-endian): 12-bit seq num + 4-bit frag num.
      *   byte 22 = (frag << 0) | (seq_lo << 4)  - frag=0, seq_lo = seq & 0xF
      *   byte 23 = seq_hi = (seq >> 4) & 0xFF
-     * seq wraps at 4096 (12-bit). We never fragment, so frag stays 0. */
-    /* FIX (AUDIT-LOW): explicit 12-bit wrap to match the on-air field
-     * width (was uint16_t growing to 65535 then masked - worked but
-     * was misleading about the wrap point). */
+     * seq wraps at 4096 (12-bit). We never fragment, so frag stays 0.
+     * AUDIT-LOW: explicit 12-bit wrap to match the on-air field width. */
     uint16_t seq = s_wifi_seq;
-    s_wifi_seq = (uint16_t)((s_wifi_seq + 1) & 0x0FFF);
-    s_frame_buf[22] = (uint8_t)(seq & 0x0F) << 4;   /* frag=0 | seq_lo */
+    s_frame_buf[22] = (uint8_t)((seq & 0x0F) << 4);   /* frag=0 | seq_lo */
     s_frame_buf[23] = (uint8_t)((seq >> 4) & 0xFF); /* seq_hi */
 
     memcpy(s_frame_buf + WIFI_HDR_LEN, data, len);
 
-    /* FIX (GROK-24) DOCUMENTATION: esp_wifi_80211_tx() in ESP8266 RTOS SDK
-     * v3.x internally enqueues a COPY of the frame into the WiFi driver's
-     * TX buffer pool before returning, so the caller's buffer may be reused
-     * immediately. s_frame_buf is static and reused per call — safe today
-     * because the copy is made synchronously before this function returns.
+    /* GROK-24: esp_wifi_80211_tx() in ESP8266 RTOS SDK v3.x enqueues a COPY
+     * of the frame into the WiFi driver's TX pool before returning, so the
+     * caller's buffer may be reused immediately. s_frame_buf is static and
+     * reused per call — safe today. IF a future SDK switches to zero-copy TX,
+     * s_frame_buf must become per-call malloc'd or guarded by a TX-done
+     * semaphore. Verify with a back-to-back stress test on SDK upgrade.
      *
-     * IF a future SDK version switches to zero-copy TX (passing the caller's
-     * buffer pointer to the radio layer and writing it back asynchronously),
-     * this static buffer would race with the next call's memcpy. The
-     * contract is documented here so a future SDK upgrade can revisit it:
-     *   - If zero-copy is introduced, s_frame_buf must become per-call
-     *     malloc'd (and freed in a TX-done callback), OR guarded by a
-     *     "TX done" semaphore with the caller blocking until completion.
-     *   - Verify with a 1-packet stress test (back-to-back rawtx_stream_send
-     *     with no delay) that no on-air corruption occurs on the target SDK.
-     *
-     * single-threaded contract: only stream_task_fn calls this (via
+     * Single-threaded contract: only stream_task_fn calls this (via
      * transport_send), so no mutex is needed for the static buffer. */
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, s_frame_buf, total_len, false);
 
+    /* Increment seq ONLY after successful TX — avoids holes in the sequence
+     * when esp_wifi_80211_tx() fails (dropped frames don't increment seq). */
+    if (err == ESP_OK) {
+        s_wifi_seq = (uint16_t)((s_wifi_seq + 1) & 0x0FFF);
+    }
+
     if (err != ESP_OK)
     {
-        /* FIX (L12): return the actual error so the caller can log it
-         * (e.g. ESP_ERR_WIFI_IF meaning "WiFi not started"). */
+        /* L12: return the actual error so the caller can log it. */
         return err;
     }
     return ESP_OK;

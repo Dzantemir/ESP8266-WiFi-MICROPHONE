@@ -19,10 +19,12 @@
  * functions become no-ops / return 0, so all functions are available (stubs when disabled).
  *
  * THREAD SAFETY:
- *   - battery_get_voltage_mv() is NOT thread-safe with concurrent ADC
- *     access. Only the battery_monitor_task should call it, OR call it
- *     from a single thread with the monitor task stopped.
- *   - battery_get_last_mv() IS thread-safe (reads a cached atomic value).
+ *   - battery_get_voltage_mv() is thread-safe via an internal mutex. On
+ *     mutex contention it returns the last cached value (s_last_mv)
+ *     instead of blocking. For accurate fresh readings, ensure only one
+ *     caller at a time (the monitor task, or a single thread with the
+ *     task stopped).
+ *   - battery_get_last_mv() is thread-safe (reads a cached atomic value).
  */
 
 /* Initialize ADC hardware. Safe to call even when battery is disabled
@@ -32,7 +34,10 @@ esp_err_t battery_init(void);
 /* Read current battery voltage in millivolts. Averages BATT_ADC_SAMPLES
  * readings with BATT_ADC_DELAY_MS between them. Takes ~750ms by default.
  * Returns 0 if ADC read fails or battery disabled.
- * Returns V_batt in mV otherwise (e.g. 3950 = 3.95V). */
+ * Returns V_batt in mV otherwise (e.g. 3950 = 3.95V).
+ * NOTE: if the internal mutex cannot be acquired, returns the last
+ * cached value (s_last_mv) instead of 0, to avoid misleading callers
+ * during brief lock contention. */
 uint32_t battery_get_voltage_mv(void);
 
 /* Get last measured voltage (cached by monitor task). Thread-safe.

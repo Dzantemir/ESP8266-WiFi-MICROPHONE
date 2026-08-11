@@ -38,9 +38,9 @@ typedef struct {
     uint8_t  comm_format;       /* I2S_CFMT_* */
     uint8_t  channel_format;    /* I2S_CHFMT_* */
     uint8_t  gain;              /* Fixed gain (0=bypass, 1-64), used when AGC off */
-    uint8_t  agc_mode;          /* 0=OFF (fixed gain), 1=LOW, 2=MEDIUM, 3=HIGH */
+    uint8_t  agc_mode;          /* 0=OFF, 1..8 = presets (see AGC_PRESETS[] in board_config.h) */
     uint8_t  codec_mode;        /* 0=ADPCM, 1=PCM (AT+CODEC) */
-    uint8_t  wifi_channel;      /* 1-13 (AT+WCH, used in RawTX transport) */
+    uint8_t  wifi_channel;      /* 1-14 (AT+WCH, used in RawTX transport) */
     uint8_t  transport_mode;    /* 0=UDP, 1=TCP, 2=Raw 802.11 TX (AT+XPORT) */
     uint8_t  i2s_timing_sd_delay;  /* 0..3, AT+TIMING sd_in_delay */
     uint8_t  i2s_timing_ws_delay;  /* 0..3, AT+TIMING ws_in_delay */
@@ -63,9 +63,9 @@ esp_err_t config_set_bits_per_sample(uint8_t bits);
 esp_err_t config_set_comm_format(uint8_t fmt);
 esp_err_t config_set_channel_format(uint8_t fmt);
 esp_err_t config_set_gain(uint8_t gain);     /* 0-64 (0 = bypass, no gain) */
-esp_err_t config_set_agc_mode(uint8_t mode); /* 0=OFF, 1=LOW, 2=MEDIUM, 3=HIGH */
+esp_err_t config_set_agc_mode(uint8_t mode); /* 0=OFF, 1..8 = presets (see AGC_PRESETS[]) */
 esp_err_t config_set_codec_mode(uint8_t mode); /* 0=ADPCM, 1=PCM */
-esp_err_t config_set_wifi_channel(uint8_t ch); /* 1-13 */
+esp_err_t config_set_wifi_channel(uint8_t ch); /* 1-14 */
 esp_err_t config_set_transport_mode(uint8_t mode); /* 0=UDP, 1=TCP, 2=RawTX */
 esp_err_t config_set_i2s_timing(uint8_t sd_delay, uint8_t ws_delay, uint8_t bck_delay); /* each 0..3 */
 

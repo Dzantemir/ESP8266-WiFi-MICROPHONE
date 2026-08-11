@@ -5,25 +5,15 @@
  * Independent module — does not share state with tcp_stream.c or
  * rawtx_stream.c. Raw 802.11 TX is in rawtx_stream.c.
  *
- * FIX (Bug #2 UDP variant): added s_state_mutex to guard s_sock / s_ready /
- * s_dest. Previously the Main task (init/deinit) and Stream TX task (send)
- * accessed these without synchronization -> race:
- *   - send() on a fd that deinit() just closed -> EBADF (usually benign on
- *     lwIP, but can corrupt internal state on some SDK versions)
- *   - worse: after deinit + re-init, the new socket may reuse the SAME fd
- *     number, and a sendto() still in-flight from before the close (lwIP
- *     sendto can block up to SO_SNDTIMEO = 2s) would send on the NEW socket
- *     with the OLD destination -> packets to wrong address.
- *   - s_ready (bool) read/write was not memory-barriered.
- * Now send() snapshots s_sock + s_dest to locals under the mutex and uses
- * the locals for sendto() (does NOT hold the mutex during the blocking
- * sendto itself). deinit() takes the mutex before close()+clear.
+ * Concurrency: s_state_mutex guards s_sock / s_ready / s_dest. send() holds
+ * the mutex across sendto() to prevent fd-recycle races (see Bug #2 / MEDIUM #24).
  */
 
 /* ---- System / SDK includes ---- */
 #include <string.h>
 #include <errno.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "lwip/sockets.h"
 #include "esp_log.h"
@@ -31,26 +21,28 @@
 /* ---- Project includes ---- */
 #include "board_config.h"
 #include "udp_stream.h"
-
-#ifndef IPTOS_DSCP_EF
-#define IPTOS_DSCP_EF 0xB8
-#endif
+#include "socket_util.h"
 
 static const char *TAG = "udp";
+
+/* Named mutex timeouts (replaces magic 50/200 literals). */
+#define SEND_MUTEX_TIMEOUT_MS       50   /* send / is_ready: drop frame if contended */
+#define DEINIT_MUTEX_TIMEOUT_MS     200  /* init / deinit: teardown path */
 
 static int s_sock = -1;
 static struct sockaddr_in s_dest;
 static bool s_ready = false;
 
-/* FIX (Bug #2 UDP): mutex guarding s_sock / s_ready / s_dest. Created on
- * first init; destroyed in deinit. NULL before first init or after full
- * deinit — all access points check for NULL before taking. */
+/* Mutex guarding s_sock / s_ready / s_dest. Created on first init (via
+ * ensure_mutex, idempotent); NEVER destroyed — kept for the lifetime of the
+ * module so deinit/init cycles can reuse it without racing on
+ * delete-while-held (FR-SVC #4, #19). All access points still check for NULL
+ * before taking (defensive — s_state_mutex is only NULL before the first
+ * init call, but the NULL-check guards against init-failure / never-inited
+ * states). */
 static SemaphoreHandle_t s_state_mutex = NULL;
 
-/* Create the mutex on first use. Idempotent.
- * FIX (AUDIT-HIGH): returns bool so callers can detect allocation failure
- * (previously silent fallthrough -> udp_stream_init proceeded with
- * s_state_mutex=NULL, all subsequent state changes unsynchronized). */
+/* Create the mutex on first use. Idempotent. Returns false on alloc failure. */
 static bool ensure_mutex(void)
 {
     if (!s_state_mutex)
@@ -65,62 +57,58 @@ static bool ensure_mutex(void)
     return true;
 }
 
-/* FIX (AUDIT-MEDIUM): UDP payload upper bound. With MTU 1500 - 20 IP - 8 UDP
- * = 1472 bytes max unfragmented. We cap at 1400 to leave headroom for
- * WiFi encap (WPA/CCMP adds 8-16 bytes, 802.11 header 30+ bytes) and match
- * the RAWTX cap. Larger payloads trigger IP fragmentation -> loss of any
- * fragment loses the whole datagram (amplifies packet loss on congested WiFi). */
+/* UDP payload upper bound: 1400 leaves headroom for WiFi encap and matches
+ * the RAWTX cap. Larger payloads trigger IP fragmentation (any fragment lost
+ * -> whole datagram lost, amplifying loss on congested WiFi). */
 #define UDP_MAX_PAYLOAD 1400
 
 esp_err_t udp_stream_init(uint32_t host_ip, uint16_t host_port)
 {
-    /* FIX (AUDIT-HIGH): propagate mutex-alloc failure instead of silently
-     * continuing without synchronization. */
+    /* FIX (FR-SVC #4, #19): ensure_mutex() is idempotent — if s_state_mutex
+     * already exists (from a previous init, or kept across a deinit since
+     * deinit no longer deletes it), don't recreate it. This eliminates the
+     * delete-while-held race in deinit entirely: the mutex is created once
+     * and lives for the module lifetime. */
     if (!ensure_mutex())
     {
         ESP_LOGE(TAG, "init: mutex alloc failed");
         return ESP_ERR_NO_MEM;
     }
 
-    /* Take mutex for the whole init. If s_ready is already true, caller
-     * should have called udp_stream_deinit() first — but be defensive:
-     * close any existing socket under the mutex before re-creating. */
-    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) != pdTRUE)
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(DEINIT_MUTEX_TIMEOUT_MS)) != pdTRUE)
     {
         ESP_LOGE(TAG, "init: state_mutex timeout");
         return ESP_ERR_TIMEOUT;
     }
 
-    if (s_ready && s_sock >= 0)
+    /* Unconditionally reset state (MEDIUM #23): previously the cleanup branch
+     * was only entered when (s_ready && s_sock >= 0), so an inconsistent state
+     * (s_ready==true && s_sock<0) skipped cleanup. */
+    if (s_sock >= 0)
     {
-        /* FIX (M5): mirror udp_stream_deinit - call shutdown() before
-         * close() to unblock any sendto() stuck in lwIP on this socket.
-         * Without shutdown(), close() alone may not wake sendto() on
-         * ESP8266 lwIP, leaving it blocked up to SO_SNDTIMEO=2s. */
-        ESP_LOGW(TAG, "init: already ready -- closing old socket first");
-        shutdown(s_sock, SHUT_RDWR);
-        close(s_sock);
-        s_sock = -1;
-        s_ready = false;
+        ESP_LOGW(TAG, "init: closing old socket (s_ready=%d) first", s_ready);
+        socket_close_safe(&s_sock);
     }
+    s_ready = false;
 
     s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s_sock < 0)
     {
-        ESP_LOGE(TAG, "socket: errno=%d", errno);
-        if (s_state_mutex) xSemaphoreGive(s_state_mutex);
+        int saved_errno = errno;  /* capture before ESP_LOGE (Task 6-D #3) */
+        ESP_LOGE(TAG, "socket: errno=%d", saved_errno);
+        xSemaphoreGive(s_state_mutex);
         return ESP_FAIL;
     }
 
-    struct timeval tv = {
-        .tv_sec = UDP_SEND_TIMEOUT_MS / 1000,
-        .tv_usec = (UDP_SEND_TIMEOUT_MS % 1000) * 1000,
-    };
-    setsockopt(s_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#if CFG_UDP_SEND_TIMEOUT_MS_ENABLED
+    (void)socket_set_send_timeout_ms(s_sock, UDP_SEND_TIMEOUT_MS);
+#endif
 
-    /* Set TOS (Type of Service) to Expedited Forwarding (Voice). */
-    int tos = IPTOS_DSCP_EF;
-    setsockopt(s_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+/* If CONFIG_ESP8266_WIFI_QOS_ENABLED is undefined, IP_TOS is silently skipped
+ * — not all SDK builds expose QoS hooks. Intentional. */
+#ifdef CONFIG_ESP8266_WIFI_QOS_ENABLED
+    (void)socket_set_tos_ef(s_sock);
+#endif
 
     memset(&s_dest, 0, sizeof(s_dest));
     s_dest.sin_family = AF_INET;
@@ -132,44 +120,43 @@ esp_err_t udp_stream_init(uint32_t host_ip, uint16_t host_port)
              (int)((host_ip >> 16) & 0xFF), (int)((host_ip >> 24) & 0xFF),
              (unsigned)host_port);
 
-    /* Order matters: set s_dest BEFORE s_ready=true so that a racing send()
-     * (which checks s_ready first then reads s_dest) never sees s_ready=true
-     * with a stale s_dest. Under the mutex this is strictly ordered. */
+    /* Set s_dest BEFORE s_ready=true so a racing send() never sees ready=true
+     * with a stale dest. Strictly ordered under the mutex. */
     s_ready = true;
 
-    if (s_state_mutex) xSemaphoreGive(s_state_mutex);
+    xSemaphoreGive(s_state_mutex);
     return ESP_OK;
 }
 
 esp_err_t udp_stream_deinit(void)
 {
-    /* FIX (Bug #2 UDP): close under the mutex so a racing send() can't
-     * capture s_sock into a local and then sendto() on a closed fd. */
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE)
+    /* Close under the mutex so a racing send() can't capture s_sock and then
+     * sendto() on a closed fd (Bug #2).
+     * FIX (FR-SVC #4, #19): do NOT delete s_state_mutex — keep it for the
+     * lifetime of the module. Deleting a mutex that another task might hold
+     * is UB; the previous NULL-first-then-delete pattern still left a
+     * Give→NULL gap during which a concurrent acquirer could end up holding
+     * a soon-to-be-deleted mutex. The mutex is created once in init() (via
+     * ensure_mutex, idempotent) and reused across deinit/init cycles, which
+     * eliminates the delete-while-held race entirely. The cost is a single
+     * persistent mutex allocation (~80 bytes) for the module lifetime — a
+     * fair trade for correctness. */
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(DEINIT_MUTEX_TIMEOUT_MS)) == pdTRUE)
     {
-        if (s_sock >= 0)
-        {
-            /* shutdown() first to unblock any sendto() stuck in lwIP on
-             * this socket (ESP8266 lwIP sometimes doesn't wake sendto()
-             * on close() alone for UDP). */
-            shutdown(s_sock, SHUT_RDWR);
-            close(s_sock);
-            s_sock = -1;
-        }
+        socket_close_safe(&s_sock);
         s_ready = false;
         xSemaphoreGive(s_state_mutex);
+        /* Do NOT delete s_state_mutex — keep it for the lifetime of the module.
+         * Deleting a mutex that another task might hold is UB. The mutex is
+         * created once in init() (idempotent via ensure_mutex) and reused
+         * across deinit/init cycles. */
     }
     else
     {
-        /* Fallback if mutex timed out (shouldn't happen — send path never
-         * holds it for long). Close without the mutex; worst case is a
-         * benign EBADF in the send path, which it already handles. */
-        if (s_sock >= 0)
-        {
-            shutdown(s_sock, SHUT_RDWR);
-            close(s_sock);
-            s_sock = -1;
-        }
+        /* Mutex busy — can't safely close s_sock (fd-recycle race with send task).
+         * Just set s_ready=false so send task stops. The socket will be closed
+         * by the next udp_stream_init() under the mutex. */
+        ESP_LOGW(TAG, "deinit: mutex busy — s_ready=false, socket left for next init");
         s_ready = false;
     }
     return ESP_OK;
@@ -177,19 +164,17 @@ esp_err_t udp_stream_deinit(void)
 
 bool udp_stream_is_ready(void)
 {
-    /* Read under mutex for memory-barrier consistency (bool r/w is atomic
-     * on Xtensa, but the mutex provides the acquire/release semantics that
-     * a bare read doesn't). */
+    /* Read under mutex for acquire/release semantics (bool r/w is atomic on
+     * Xtensa, but the mutex provides the barrier a bare read doesn't). */
     bool r = false;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(SEND_MUTEX_TIMEOUT_MS)) == pdTRUE)
     {
         r = s_ready;
         xSemaphoreGive(s_state_mutex);
     }
     else
     {
-        /* Mutex timeout — return the raw value (best effort). */
-        r = s_ready;
+        r = s_ready;  /* best-effort fallback */
     }
     return r;
 }
@@ -198,7 +183,6 @@ esp_err_t udp_stream_send(const uint8_t *data, size_t len)
 {
     if (!data || !len)
         return ESP_ERR_INVALID_ARG;
-    /* FIX (AUDIT-MEDIUM): reject oversized payloads to avoid IP fragmentation. */
     if (len > UDP_MAX_PAYLOAD)
     {
         ESP_LOGW(TAG, "send: payload %u > %u, rejecting",
@@ -206,58 +190,45 @@ esp_err_t udp_stream_send(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    /* FIX (Bug #2 UDP): snapshot sock + dest under the mutex. deinit() may
-     * close s_sock at any moment (stop_streaming / transport switch); we
-     * must NOT sendto() on a fd that's about to be closed. By copying to
-     * locals under the mutex, we get a stable fd + dest for the duration
-     * of this sendto(). If deinit() closes it meanwhile, our local still
-     * points to the old fd — which deinit() already close()d, so sendto()
-     * will fail fast with EBADF (handled below) instead of corrupting a
-     * new socket that init() may have created with the same fd number. */
+    /* Hold the state mutex across sendto() (MEDIUM #24 / LOW #38) so deinit()
+     * cannot recycle the socket fd while a send is in flight. Contention is
+     * minimal (send is per audio frame; deinit is rare). */
     int sock;
     struct sockaddr_in dest;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    if (!(s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(SEND_MUTEX_TIMEOUT_MS)) == pdTRUE))
     {
-        sock = s_sock;
-        dest = s_dest;
-        bool ready = s_ready;
-        xSemaphoreGive(s_state_mutex);
-        if (!ready || sock < 0)
-            return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_STATE;  /* drop frame rather than unsync send */
     }
-    else
+
+    sock = s_sock;
+    dest = s_dest;
+    if (sock < 0 || !s_ready)
     {
-        /* Mutex timeout — extremely rare (deinit never holds it for long).
-         * Drop the frame rather than risk an unsynchronized send. */
+        xSemaphoreGive(s_state_mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (sendto(sock, data, len, 0,
-               (struct sockaddr *)&dest, sizeof(dest)) < 0)
+    int sendto_ret = sendto(sock, data, len, MSG_DONTWAIT,
+                            (struct sockaddr *)&dest, sizeof(dest));
+    xSemaphoreGive(s_state_mutex);
+
+    if (sendto_ret < 0)
     {
-        /* Common errors:
-         *   EBADF (9)   — deinit closed the fd under us; benign.
-         *   ENOMEM (12) — lwIP out of buffers (WiFi congested); drop frame.
-         *   EHOSTUNREACH (118) — WiFi still associating; drop frame.
-         *
-         * FIX (AUDIT-LOW): log the errno so congestion vs. deinit-race vs.
-         * no-association can be distinguished during debugging.
-         *
-         * FIX (log-fix-D): on ENOMEM (12), add a 1ms backoff. The log
-         * showed 10+ consecutive errno=12 events because the TX loop
-         * immediately retried sendto() with the next frame, but lwIP's
-         * send buffer was still full from the previous failed send.
-         * A 1ms delay gives lwIP time to drain one buffer slot, so the
-         * next frame has a chance to succeed instead of also failing.
-         * This reduces burst-drop patterns that cause server underruns. */
         int saved_errno = errno;
         ESP_LOGW(TAG, "sendto failed: errno=%d len=%u", saved_errno, (unsigned)len);
-        if (saved_errno == 12) /* ENOMEM - lwIP buffer exhaustion */
-        {
+        /* EHOSTUNREACH is 118 in newlib but may differ in some lwIP builds —
+         * keep the || 118 fallback (HIGH #13). */
+        if (saved_errno == ENOMEM)
             vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        (void)saved_errno;
+        else if (saved_errno == ENODEV)
+            vTaskDelay(pdMS_TO_TICKS(500));
+        else if (saved_errno == EHOSTUNREACH || saved_errno == 118)
+            vTaskDelay(pdMS_TO_TICKS(200));
+        else if (saved_errno != EBADF && saved_errno != ENOTCONN)
+            vTaskDelay(pdMS_TO_TICKS(100));
+
         return ESP_FAIL;
     }
+
     return ESP_OK;
 }

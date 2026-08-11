@@ -75,7 +75,11 @@ typedef struct {
     /* Initialize the service port (if this mode uses one).
      * UDP/TCP: svc_port_init() if not already running.
      * RAWTX:   no-op.
-     * Idempotent - safe to call multiple times. */
+     * Idempotent - safe to call multiple times.
+     * NOTE: parameter order is (evt_grp, port) here, but the underlying
+     * svc_port_init() in svc_port.h takes (port, evt_grp). The wrapper
+     * in stream_mode.c handles the swap. Keep this order for vtable
+     * consistency with other callbacks that take cfg/handle first. */
     esp_err_t (*svc_port_init)(EventGroupHandle_t evt_grp, uint16_t port);
 
     /* Resolve the stream destination address.
@@ -108,6 +112,13 @@ typedef struct {
      * (TCP). For UDP/RAWTX: same as deinit (no persistent listener).
      * Used by stop_streaming() to allow quick restart without EADDRINUSE. */
     void (*close_client)(void);
+
+    /* F2-TCP (#1.2): Abort any in-flight blocking send() so the sender task
+     * can self-exit within the stop timeout. TCP: shutdown(SHUT_RDWR) on the
+     * active client socket (unblocks send() immediately). UDP/RAWTX: no-op
+     * (their send paths are non-blocking or have short bounded latency).
+     * Called by teardown_pipeline() BEFORE waiting for the TX task to exit. */
+    void (*abort_send)(void);
 
     /* Full teardown: close listener + client + stop accept task (TCP).
      * For UDP/RAWTX: close socket / free state.
@@ -161,11 +172,19 @@ const stream_mode_ops_t *stream_mode_ops(void);
  * as a safe default). */
 uint8_t stream_mode_current_transport(void);
 
+
+/* Get the ops table for a specific transport mode WITHOUT changing the
+ * active mode. Used by start_streaming() to check needs_wifi_association
+ * compatibility before committing to stream_mode_init(). Returns &s_udp_ops
+ * for unknown modes (same default as stream_mode_init). */
+const stream_mode_ops_t *stream_mode_ops_for(uint8_t transport_mode);
+
 /* ---- Transport-agnostic wrappers (thin proxies to ops table) ----
  * main.c calls these. No if-branches on transport type — pure vtable dispatch. */
 bool      transport_is_ready(void);
 esp_err_t transport_send(const uint8_t *data, size_t len);
 esp_err_t transport_deinit(void);
 void      transport_close_client(void);
+void      transport_abort_send(void);  /* F2-TCP (#1.2) */
 
 #endif /* STREAM_MODE_H */

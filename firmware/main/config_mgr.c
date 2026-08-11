@@ -8,6 +8,7 @@
 
 /* ---- System / SDK includes ---- */
 #include <string.h>
+#include <stddef.h> /* offsetof — R2-B table-driven setters */
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
@@ -16,6 +17,39 @@
 /* ---- Project includes ---- */
 #include "board_config.h"
 #include "config_mgr.h"
+/* stream_control.h: streaming_get_frame_ms() / streaming_frame_ms_known()
+ * prototypes (2-E LOW — previously declared as fragile `extern` in init()). */
+#include "stream_control.h"
+
+/* ---- Board config data tables (defined once here, shared via extern
+ *      in board_audio.h). FIX (F-E LOW): previously these were `static const`
+ *      in the header — every translation unit that included board_audio.h
+ *      got its own private copy, wasting flash. Now defined once here and
+ *      declared `extern` in board_audio.h. Initializer lists copied
+ *      byte-for-byte from the previous header definition. ---- */
+const uint32_t VALID_SAMPLE_RATES[SAMPLE_RATE_COUNT] = {
+    8000, 11025, 16000, 22050, 32000, 44100, 48000};
+
+const agc_preset_t AGC_PRESETS[AGC_MODE_COUNT] = {
+    /* 0: OFF — bypass, use fixed gain (AT+GAIN) */
+    {"OFF", 0, 0, 0, 0, AGC_MIN_GAIN_BOOST_ONLY},
+    /* 1: Studio Soft — smooth, minimal pumping. target=-18dBFS, gate=-48dBFS */
+    {"Studio Soft", 30, 5, 8248, 261, AGC_MIN_GAIN_BOOST_ONLY},
+    /* 2: Podcast — smooth voice control. target=-18dBFS, gate=-42dBFS */
+    {"Podcast", 50, 15, 8248, 521, AGC_MIN_GAIN_BOOST_ONLY},
+    /* 3: Voice Balanced — default for speech. target=-18dBFS, gate=-42dBFS */
+    {"Voice Balanced", 75, 20, 8248, 521, AGC_MIN_GAIN_BOOST_ONLY},
+    /* 4: Voice Fast — fast reaction. target=-18dBFS, gate=-36dBFS */
+    {"Voice Fast", 90, 40, 8248, 1039, AGC_MIN_GAIN_BOOST_ONLY},
+    /* 5: Noisy Room — high gate cuts background. target=-15dBFS, gate=-30dBFS */
+    {"Noisy Room", 60, 25, 11658, 2073, AGC_MIN_GAIN_BOOST_ONLY},
+    /* 6: Music — slow attack preserves transients. target=-12dBFS, gate=-60dBFS */
+    {"Music", 15, 60, 16463, 66, AGC_MIN_GAIN_BOOST_ONLY},
+    /* 7: Limiter — limits peaks (can attenuate to -36dB). target=-6dBFS, gate=-60dBFS */
+    {"Limiter", 100, 5, 32846, 66, AGC_MIN_GAIN_LIMITER},
+    /* 8: Surveillance — aggressive, constant level. target=-12dBFS, gate=-60dBFS */
+    {"Surveillance", 95, 80, 16463, 66, AGC_MIN_GAIN_LIMITER},
+};
 
 static const char *TAG = "config_mgr";
 static const char *NVS_NAMESPACE = "streamer";
@@ -43,8 +77,8 @@ static void set_defaults(device_config_t *cfg)
     cfg->codec_mode = AUDIO_CODEC_DEFAULT;
     cfg->wifi_channel = RAWTX_CHANNEL_DEFAULT;
     cfg->transport_mode = TRANSPORT_MODE_DEFAULT;
-    cfg->i2s_timing_sd_delay  = I2S_TIMING_SD_DELAY_DEFAULT;
-    cfg->i2s_timing_ws_delay  = I2S_TIMING_WS_DELAY_DEFAULT;
+    cfg->i2s_timing_sd_delay = I2S_TIMING_SD_DELAY_DEFAULT;
+    cfg->i2s_timing_ws_delay = I2S_TIMING_WS_DELAY_DEFAULT;
     cfg->i2s_timing_bck_delay = I2S_TIMING_BCK_DELAY_DEFAULT;
 }
 
@@ -60,12 +94,10 @@ static esp_err_t load_from_nvs(device_config_t *cfg)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
     if (err != ESP_OK)
     {
-        /* FIX (L31): log the specific error code so the user can distinguish
-         * "namespace absent" (ESP_ERR_NVS_NOT_FOUND, normal on first boot)
-         * from "NVS corrupt" (ESP_ERR_NVS_NOT_INITIALIZED, requires flash
-         * erase). Without this, both look the same to the caller. */
+        /* Log the specific error code (L31): distinguish "namespace absent"
+         * (NOT_FOUND, first boot) from "NVS corrupt" (NOT_INITIALIZED). */
         ESP_LOGW(TAG, "load_from_nvs: nvs_open failed: %s "
-                 "(NOT_FOUND=first boot, NOT_INITIALIZED=NVS corrupt)",
+                      "(NOT_FOUND=first boot, NOT_INITIALIZED=NVS corrupt)",
                  esp_err_to_name(err));
         return err;
     }
@@ -73,33 +105,37 @@ static esp_err_t load_from_nvs(device_config_t *cfg)
     size_t len;
     esp_err_t e;
 
-    /* FIX (C7): check each nvs_get_str return. If a key is missing (e.g.
-     * after a firmware upgrade that added a new string field, or NVS
-     * corruption), fall back to the corresponding compile-time default
-     * instead of leaving the field as an empty string. */
+    /* Fall back to compile-time defaults when a string key is missing (C7). */
     len = sizeof(cfg->wifi_ssid);
     e = nvs_get_str(h, "ssid", cfg->wifi_ssid, &len);
     if (e != ESP_OK || !cfg->wifi_ssid[0])
+    {
         strncpy(cfg->wifi_ssid, WIFI_SSID_DEFAULT, sizeof(cfg->wifi_ssid) - 1);
+        cfg->wifi_ssid[sizeof(cfg->wifi_ssid) - 1] = '\0';
+    }
     len = sizeof(cfg->wifi_password);
     e = nvs_get_str(h, "pass", cfg->wifi_password, &len);
     if (e != ESP_OK)
+    {
         strncpy(cfg->wifi_password, WIFI_PASSWORD_DEFAULT, sizeof(cfg->wifi_password) - 1);
+        cfg->wifi_password[sizeof(cfg->wifi_password) - 1] = '\0';
+    }
+    /* Warn (don't fail) on empty password (2-E LOW): open AP or NVS corruption. */
+    if (e == ESP_OK && !cfg->wifi_password[0])
+    {
+        ESP_LOGW(TAG, "load_from_nvs: empty password loaded - open AP, or NVS corruption");
+    }
     len = sizeof(cfg->hostname);
     e = nvs_get_str(h, "host", cfg->hostname, &len);
     if (e != ESP_OK || !cfg->hostname[0])
+    {
         strncpy(cfg->hostname, WIFI_HOSTNAME_DEFAULT, sizeof(cfg->hostname) - 1);
+        cfg->hostname[sizeof(cfg->hostname) - 1] = '\0';
+    }
 
-    /* FIX (GROK-6): check each nvs_get_* return and apply the compile-time
-     * default when the key is missing. The OLD code called nvs_get_u8/u16/u32
-     * without checking the return — on a partial NVS (e.g. after a firmware
-     * upgrade that added a new field, or NVS corruption), missing keys left
-     * the field at 0 (from the memset above). With set_defaults() only called
-     * on nvs_open failure, this produced silent wrong configs: gain=0 (bypass
-     * instead of 32), agc=0 (OFF instead of VOICE_BALANCED), transport=0
-     * (UDP instead of configured default), etc. Range validation further down
-     * only catches out-of-range values; values where 0 is "valid but
-     * unintended" (gain=0, agc=0) slip through silently. */
+    /* Apply compile-time defaults when each scalar key is missing (GROK-6):
+     * the OLD code called nvs_get_* without checking the return — on partial
+     * NVS, missing keys left fields at 0 (gain=0 bypass, agc=0 OFF, etc.). */
     if (nvs_get_u8(h, "txpwr", &cfg->tx_power) != ESP_OK)
         cfg->tx_power = WIFI_TX_POWER_DEFAULT;
     if (nvs_get_u16(h, "svcport", &cfg->svc_port) != ESP_OK)
@@ -142,27 +178,47 @@ static esp_err_t save_to_nvs(const device_config_t *cfg)
         return err;
     }
 
-    /* FIX (M19): check each nvs_set_* return. If the namespace is full,
-     * individual sets fail silently; without this check the commit then
-     * succeeds and the user thinks the value was saved but it wasn't. */
+    /* Check each nvs_set_* return (M19): if the namespace is full, individual
+     * sets fail silently; without this check the commit succeeds and the user
+     * thinks the value was saved but it wasn't. */
     esp_err_t e;
-    if ((e = nvs_set_str(h, "ssid", cfg->wifi_ssid)) != ESP_OK)        goto save_fail;
-    if ((e = nvs_set_str(h, "pass", cfg->wifi_password)) != ESP_OK)    goto save_fail;
-    if ((e = nvs_set_str(h, "host", cfg->hostname)) != ESP_OK)         goto save_fail;
-    if ((e = nvs_set_u8(h, "txpwr", cfg->tx_power)) != ESP_OK)         goto save_fail;
-    if ((e = nvs_set_u16(h, "svcport", cfg->svc_port)) != ESP_OK)      goto save_fail;
-    if ((e = nvs_set_u32(h, "rate", cfg->sample_rate)) != ESP_OK)      goto save_fail;
-    if ((e = nvs_set_u8(h, "bits", cfg->bits_per_sample)) != ESP_OK)   goto save_fail;
-    if ((e = nvs_set_u8(h, "fmt", cfg->comm_format)) != ESP_OK)        goto save_fail;
-    if ((e = nvs_set_u8(h, "ch", cfg->channel_format)) != ESP_OK)      goto save_fail;
-    if ((e = nvs_set_u8(h, "gain", cfg->gain)) != ESP_OK)              goto save_fail;
-    if ((e = nvs_set_u8(h, "agc", cfg->agc_mode)) != ESP_OK)           goto save_fail;
-    if ((e = nvs_set_u8(h, "codec", cfg->codec_mode)) != ESP_OK)       goto save_fail;
-    if ((e = nvs_set_u8(h, "wch", cfg->wifi_channel)) != ESP_OK)       goto save_fail;
-    if ((e = nvs_set_u8(h, "xport", cfg->transport_mode)) != ESP_OK)   goto save_fail;
-    if ((e = nvs_set_u8(h, "tmsd", cfg->i2s_timing_sd_delay)) != ESP_OK)  goto save_fail;
-    if ((e = nvs_set_u8(h, "tmws", cfg->i2s_timing_ws_delay)) != ESP_OK)  goto save_fail;
-    if ((e = nvs_set_u8(h, "tmbck", cfg->i2s_timing_bck_delay)) != ESP_OK) goto save_fail;
+    if ((e = nvs_set_str(h, "ssid", cfg->wifi_ssid)) != ESP_OK)
+        goto save_fail;
+    /* SECURITY NOTE: WiFi password is stored in plaintext in NVS.
+     * Any attacker with flash access can read it. NVS encryption
+     * (if supported by the SDK) should be enabled for production. */
+    if ((e = nvs_set_str(h, "pass", cfg->wifi_password)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_str(h, "host", cfg->hostname)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "txpwr", cfg->tx_power)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u16(h, "svcport", cfg->svc_port)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u32(h, "rate", cfg->sample_rate)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "bits", cfg->bits_per_sample)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "fmt", cfg->comm_format)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "ch", cfg->channel_format)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "gain", cfg->gain)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "agc", cfg->agc_mode)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "codec", cfg->codec_mode)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "wch", cfg->wifi_channel)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "xport", cfg->transport_mode)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "tmsd", cfg->i2s_timing_sd_delay)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "tmws", cfg->i2s_timing_ws_delay)) != ESP_OK)
+        goto save_fail;
+    if ((e = nvs_set_u8(h, "tmbck", cfg->i2s_timing_bck_delay)) != ESP_OK)
+        goto save_fail;
 
     err = nvs_commit(h);
     nvs_close(h);
@@ -172,6 +228,189 @@ save_fail:
     ESP_LOGE(TAG, "save_to_nvs: nvs_set_* failed: %s", esp_err_to_name(e));
     nvs_close(h);
     return e;
+}
+
+/* ---- Field descriptor table (R2-B) ----
+ *
+ * The 14 numeric config_set_* setters each repeat the same ~25-line shape
+ * (validate -> lock -> snapshot -> modify -> save -> unlock -> log). The
+ * FIELDS[] table captures name / type / offset / validate-fn so all 11
+ * single-field setters and the 3-field i2s_timing setter can share one
+ * generic implementation (config_set_fields). The two string setters
+ * (config_set_wifi, config_set_hostname) keep their bespoke bodies below
+ * — they need length + character-class validation that doesn't fit the
+ * numeric table.
+ */
+typedef enum
+{
+    FIELD_TX_POWER = 0,
+    FIELD_SVC_PORT,
+    FIELD_SAMPLE_RATE,
+    FIELD_BITS_PER_SAMPLE,
+    FIELD_COMM_FORMAT,
+    FIELD_CHANNEL_FORMAT,
+    FIELD_GAIN,
+    FIELD_AGC_MODE,
+    FIELD_CODEC_MODE,
+    FIELD_WIFI_CHANNEL,
+    FIELD_TRANSPORT_MODE,
+    FIELD_I2S_TIMING_SD,
+    FIELD_I2S_TIMING_WS,
+    FIELD_I2S_TIMING_BCK,
+    FIELD_COUNT,
+} field_id_t;
+
+typedef enum
+{
+    FIELD_U8,
+    FIELD_U16,
+    FIELD_U32,
+} field_type_t;
+
+typedef struct
+{
+    const char *name; /* for logging */
+    field_type_t type;
+    size_t offset; /* offset into device_config_t */
+    bool (*validate)(uint32_t value);
+} field_desc_t;
+
+/* Per-field validation. Extracted verbatim from the original setters + the
+ * NVS-load path in config_mgr_init so the two paths can never drift. */
+static bool validate_gain(uint32_t v) { return v <= 64; }
+static bool validate_agc_mode(uint32_t v) { return v < AGC_MODE_COUNT; }
+static bool validate_bits(uint32_t v) { return v == 16 || v == 24; }
+static bool validate_codec(uint32_t v) { return v <= CODEC_MODE_PCM; }
+static bool validate_transport(uint32_t v) { return v <= TRANSPORT_MODE_RAWTX; }
+/* channel_format: only {LEFT=4, RIGHT=3, STEREO=0} are valid — NOT every
+ * value <= 4 (the in-between enum slots are reserved/unusable on the
+ * ESP8266 I2S peripheral, see I2S_CHFMT_* in config_mgr.h). */
+static bool validate_channel_fmt(uint32_t v) { return v == I2S_CHFMT_LEFT || v == I2S_CHFMT_RIGHT || v == I2S_CHFMT_STEREO; }
+static bool validate_comm_fmt(uint32_t v) { return v == I2S_CFMT_PHILIPS || v == I2S_CFMT_LSB; }
+static bool validate_wifi_channel(uint32_t v) { return v >= 1 && v <= 14; }
+static bool validate_tx_power(uint32_t v) { return v <= WIFI_TX_POWER_MAX; }
+static bool validate_svc_port(uint32_t v) { return v > 0 && v <= 65535; }
+static bool validate_sample_rate(uint32_t v) { return sample_rate_is_valid(v); }
+static bool validate_timing(uint32_t v) { return v <= I2S_TIMING_DELAY_MAX; }
+
+static const field_desc_t FIELDS[FIELD_COUNT] = {
+    [FIELD_TX_POWER] = {"tx_power", FIELD_U8, offsetof(device_config_t, tx_power), validate_tx_power},
+    [FIELD_SVC_PORT] = {"svc_port", FIELD_U16, offsetof(device_config_t, svc_port), validate_svc_port},
+    [FIELD_SAMPLE_RATE] = {"sample_rate", FIELD_U32, offsetof(device_config_t, sample_rate), validate_sample_rate},
+    [FIELD_BITS_PER_SAMPLE] = {"bits_per_sample", FIELD_U8, offsetof(device_config_t, bits_per_sample), validate_bits},
+    [FIELD_COMM_FORMAT] = {"comm_format", FIELD_U8, offsetof(device_config_t, comm_format), validate_comm_fmt},
+    [FIELD_CHANNEL_FORMAT] = {"channel_format", FIELD_U8, offsetof(device_config_t, channel_format), validate_channel_fmt},
+    [FIELD_GAIN] = {"gain", FIELD_U8, offsetof(device_config_t, gain), validate_gain},
+    [FIELD_AGC_MODE] = {"agc_mode", FIELD_U8, offsetof(device_config_t, agc_mode), validate_agc_mode},
+    [FIELD_CODEC_MODE] = {"codec_mode", FIELD_U8, offsetof(device_config_t, codec_mode), validate_codec},
+    [FIELD_WIFI_CHANNEL] = {"wifi_channel", FIELD_U8, offsetof(device_config_t, wifi_channel), validate_wifi_channel},
+    [FIELD_TRANSPORT_MODE] = {"transport_mode", FIELD_U8, offsetof(device_config_t, transport_mode), validate_transport},
+    [FIELD_I2S_TIMING_SD] = {"i2s_timing_sd", FIELD_U8, offsetof(device_config_t, i2s_timing_sd_delay), validate_timing},
+    [FIELD_I2S_TIMING_WS] = {"i2s_timing_ws", FIELD_U8, offsetof(device_config_t, i2s_timing_ws_delay), validate_timing},
+    [FIELD_I2S_TIMING_BCK] = {"i2s_timing_bck", FIELD_U8, offsetof(device_config_t, i2s_timing_bck_delay), validate_timing},
+};
+
+/*
+ * Apply N numeric field updates atomically:
+ *   1. validate ALL fields up-front (no partial apply on a bad batch),
+ *   2. take mutex, snapshot the whole struct (M21),
+ *   3. modify each field via its offset + type tag,
+ *   4. save_to_nvs; on failure restore the snapshot (GROK-G11-18 rollback),
+ *   5. give mutex, log.
+ * Used by config_set_field (n=1) and config_set_i2s_timing (n=3). The
+ * whole-struct snapshot is ~120 B on the stack — cheaper than 3 separate
+ * take/save/give cycles and the only way to keep the 3-field i2s_timing
+ * update atomic (calling config_set_field 3× would triple the NVS writes
+ * and break rollback on a mid-batch save failure).
+ */
+static esp_err_t config_set_fields(const field_id_t *ids, const uint32_t *values, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        const field_desc_t *f = &FIELDS[ids[i]];
+        if (f->validate && !f->validate(values[i]))
+        {
+            ESP_LOGW(TAG, "%s %u out of range", f->name, (unsigned)values[i]);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    /* Bail out if mutex not initialized (AUDIT-H17). */
+    if (!s_initialized || !s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* Snapshot whole struct so rollback is one assignment on save failure. */
+    device_config_t old = s_config;
+    for (size_t i = 0; i < n; i++)
+    {
+        const field_desc_t *f = &FIELDS[ids[i]];
+        char *dst = (char *)&s_config + f->offset;
+        /* FIX FR-AT #18: see FIXES.md — use memcpy instead of pointer casts.
+         * The previous pointer casts *(uint8_t*)dst / *(uint16_t*)dst /
+         * *(uint32_t*)dst are technically UB on architectures with strict
+         * alignment (uint16_t/uint32_t require 2/4-byte alignment). On the
+         * ESP8266 (Xtensa LX106) this happens to work for the field offsets
+         * in FIELDS[] (all are naturally aligned in device_config_t), but
+         * memcpy is the portable C idiom and lets the compiler emit the
+         * same code on this target. */
+        switch (f->type)
+        {
+        case FIELD_U8:
+        {
+            uint8_t v8 = (uint8_t)values[i];
+            memcpy(dst, &v8, sizeof(v8));
+            break;
+        }
+        case FIELD_U16:
+        {
+            uint16_t v16 = (uint16_t)values[i];
+            memcpy(dst, &v16, sizeof(v16));
+            break;
+        }
+        case FIELD_U32:
+        {
+            uint32_t v32 = values[i];
+            memcpy(dst, &v32, sizeof(v32));
+            break;
+        }
+        default:
+        {
+            ESP_LOGE(TAG, "config_set_fields: unknown field type %d", (int)f->type);
+            xSemaphoreGive(s_mutex);
+            return ESP_ERR_INVALID_STATE;
+        }
+        }
+    }
+    esp_err_t err = save_to_nvs(&s_config);
+    if (err != ESP_OK)
+        s_config = old; /* rollback to pre-call state */
+    xSemaphoreGive(s_mutex);
+    if (err == ESP_OK)
+    {
+        if (n == 1)
+            ESP_LOGI(TAG, "Config saved to NVS (%s=%u)",
+                     FIELDS[ids[0]].name, (unsigned)values[0]);
+        else
+            ESP_LOGI(TAG, "Config saved to NVS (%u fields)", (unsigned)n);
+    }
+    else
+    {
+        if (n == 1)
+            ESP_LOGW(TAG, "Config save FAILED (%s) - rolled back",
+                     FIELDS[ids[0]].name);
+        else
+            ESP_LOGW(TAG, "Config save FAILED (%u fields) - rolled back",
+                     (unsigned)n);
+    }
+    return err;
+}
+
+/* Generic single-field setter. The 11 numeric wrappers below delegate here. */
+static esp_err_t config_set_field(field_id_t id, uint32_t value)
+{
+    return config_set_fields(&id, &value, 1);
 }
 
 /* ---- Public API ---- */
@@ -198,88 +437,122 @@ esp_err_t config_mgr_init(void)
     {
         ESP_LOGI(TAG, "No NVS config - saving defaults");
         set_defaults(&s_config); /* Восстанавливаем - load_from_nvs мог обнулить */
-        save_to_nvs(&s_config);
+        /* Check save_to_nvs return on first boot (2-E LOW): a silent NVS write
+         * failure would leave the device running on in-RAM defaults with no
+         * persistence — every reboot would re-trigger "No NVS config". Don't
+         * fail init: the device can still operate with in-RAM defaults. */
+        esp_err_t save_err = save_to_nvs(&s_config);
+        if (save_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "save_to_nvs of defaults failed on first boot: %s "
+                          "(device will use in-RAM defaults, no persistence)",
+                     esp_err_to_name(save_err));
+        }
     }
     else
     {
         ESP_LOGI(TAG, "Config loaded from NVS");
     }
 
-    /* Validate loaded values, fall back to defaults if invalid. */
+    /* Validate loaded values, fall back to defaults if invalid.
+     * The per-field rules mirror the validate_* functions above (R2-B); kept
+     * inline here so a corrupt NVS value still gets clamped on load (where
+     * there is no caller-supplied value to reject). */
+
+    bool corrected = false;
+
     if (!sample_rate_is_valid(s_config.sample_rate))
     {
         s_config.sample_rate = AUDIO_SAMPLE_RATE_DEFAULT;
+        corrected = true;
     }
     if (s_config.bits_per_sample != 16 && s_config.bits_per_sample != 24)
     {
         s_config.bits_per_sample = I2S_BITS_PER_SAMPLE;
+        corrected = true;
     }
     if (s_config.comm_format != I2S_CFMT_PHILIPS && s_config.comm_format != I2S_CFMT_LSB)
     {
         s_config.comm_format = I2S_COMM_FORMAT_CFG;
+        corrected = true;
     }
     if (s_config.channel_format != I2S_CHFMT_LEFT &&
         s_config.channel_format != I2S_CHFMT_RIGHT &&
         s_config.channel_format != I2S_CHFMT_STEREO)
     {
         s_config.channel_format = I2S_CHANNEL_FORMAT;
+        corrected = true;
     }
     if (s_config.tx_power > WIFI_TX_POWER_MAX)
     {
         s_config.tx_power = WIFI_TX_POWER_DEFAULT;
+        corrected = true;
     }
     if (s_config.gain > 64)
     {
         s_config.gain = AUDIO_GAIN_DEFAULT;
+        corrected = true;
     }
     if (s_config.agc_mode >= AGC_MODE_COUNT)
     {
         s_config.agc_mode = AUDIO_AGC_DEFAULT;
+        corrected = true;
     }
     if (s_config.codec_mode > CODEC_MODE_PCM)
     {
         s_config.codec_mode = AUDIO_CODEC_DEFAULT;
+        corrected = true;
     }
-    if (s_config.wifi_channel < 1 || s_config.wifi_channel > 13)
+    if (s_config.wifi_channel < 1 || s_config.wifi_channel > 14)
     {
         s_config.wifi_channel = 1;
+        corrected = true;
     }
-    /* FIX (AUDIT-H18): svc_port=0 lets the OS pick a random ephemeral port
-     * on bind() -> the receiver can't discover the device on the expected
-     * port. Fall back to the configured default if NVS value is missing or
-     * corrupted (e.g. first boot after a firmware upgrade that added the
-     * field, or NVS corruption). */
+    /* svc_port=0 lets the OS pick a random ephemeral port on bind() (AUDIT-H18)
+     * -> the receiver can't discover the device on the expected port. */
     if (s_config.svc_port == 0)
     {
         s_config.svc_port = SVC_PORT_DEFAULT;
+        corrected = true;
     }
     if (s_config.transport_mode > TRANSPORT_MODE_RAWTX)
     {
         s_config.transport_mode = TRANSPORT_MODE_DEFAULT;
+        corrected = true;
     }
     if (s_config.i2s_timing_sd_delay > I2S_TIMING_DELAY_MAX)
     {
         s_config.i2s_timing_sd_delay = I2S_TIMING_SD_DELAY_DEFAULT;
+        corrected = true;
     }
     if (s_config.i2s_timing_ws_delay > I2S_TIMING_DELAY_MAX)
     {
         s_config.i2s_timing_ws_delay = I2S_TIMING_WS_DELAY_DEFAULT;
+        corrected = true;
     }
     if (s_config.i2s_timing_bck_delay > I2S_TIMING_DELAY_MAX)
     {
         s_config.i2s_timing_bck_delay = I2S_TIMING_BCK_DELAY_DEFAULT;
+        corrected = true;
     }
-    /* FIX (GROK-G11-8): previously hardcoded `20` for the frame_ms field,
-     * which lied about the actual runtime frame_ms (computed by
-     * i2s_capture_compute_frame_ms from rate/channels/codec/MTU, ranges
-     * 5..60ms). Now we either print the last-known runtime frame_ms (if a
-     * previous stream set it) or "init" if no stream has run yet. The
-     * streaming_frame_ms_known() predicate distinguishes the two cases. */
+
+    if (corrected)
     {
-        extern uint32_t streaming_get_frame_ms(void);
-        extern bool streaming_frame_ms_known(void);
+        ESP_LOGW(TAG, "Some NVS values were invalid and corrected - saving fixed config");
+        esp_err_t save_err = save_to_nvs(&s_config);
+        if (save_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to save corrected config: %s", esp_err_to_name(save_err));
+        }
+    }
+    /* Print last-known runtime frame_ms (GROK-G11-8): previously hardcoded
+     * `20` lied about the actual runtime frame_ms (5..60ms). The
+     * streaming_frame_ms_known() predicate distinguishes "real computed
+     * value" from "init". */
+    {
         const char *frame_ms_str = streaming_frame_ms_known()
-            ? "" : " (init, not yet computed)";
+                                       ? ""
+                                       : " (init, not yet computed)";
         ESP_LOGI(TAG, "Runtime audio: %u Hz, %u ms%s, %d-bit, fmt=%d, ch=%d, gain=%u, agc=%u, codec=%u",
                  (unsigned)s_config.sample_rate,
                  (unsigned)streaming_get_frame_ms(),
@@ -301,8 +574,8 @@ void config_get_copy(device_config_t *cfg)
             set_defaults(cfg);
         return;
     }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    /* Bail out if config_mgr_init() failed to create the mutex (AUDIT-H17):
+     * xSemaphoreTake(NULL, ...) crashes. */
     if (!s_mutex)
     {
         ESP_LOGE(TAG, "config mutex not initialized");
@@ -319,17 +592,23 @@ static esp_err_t save_locked(void)
     return save_to_nvs(&s_config);
 }
 
+/* ---- String setters (bespoke: dual-field / RFC-952 validation) ---- */
+
 esp_err_t config_set_wifi(const char *ssid, const char *password)
 {
     if (!ssid || !password || !ssid[0] || !password[0])
     {
         return ESP_ERR_INVALID_ARG;
     }
-    /* FIX (L30): reject whitespace-only SSID. 802.11 allows it but it's
-     * almost certainly a user typo. */
+    /* Reject whitespace-only SSID (L30): 802.11 allows it but it's almost
+     * certainly a user typo. */
     bool ssid_has_nonws = false;
     for (const char *p = ssid; *p; p++)
-        if (*p != ' ' && *p != '\t') { ssid_has_nonws = true; break; }
+        if (*p != ' ' && *p != '\t')
+        {
+            ssid_has_nonws = true;
+            break;
+        }
     if (!ssid_has_nonws)
         return ESP_ERR_INVALID_ARG;
     if (strlen(ssid) >= sizeof(s_config.wifi_ssid) ||
@@ -337,18 +616,16 @@ esp_err_t config_set_wifi(const char *ssid, const char *password)
     {
         return ESP_ERR_INVALID_SIZE;
     }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    /* Bail out if mutex not initialized (AUDIT-H17). */
     if (!s_mutex)
     {
         ESP_LOGE(TAG, "config mutex not initialized");
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (M21): capture previous values so we can roll back the in-memory
-     * state if save_to_nvs fails. Without this, runtime != persisted state
-     * after a save failure: AT+xxx? shows the new value, but on reboot the
-     * old value is loaded -> user confusion. */
+    /* Capture previous values so we can roll back the in-memory state if
+     * save_to_nvs fails (M21): without this, runtime != persisted state after
+     * a save failure -> user confusion after reboot. */
     char old_ssid[sizeof(s_config.wifi_ssid)];
     char old_pass[sizeof(s_config.wifi_password)];
     memcpy(old_ssid, s_config.wifi_ssid, sizeof(old_ssid));
@@ -370,7 +647,7 @@ esp_err_t config_set_wifi(const char *ssid, const char *password)
         ESP_LOGI(TAG, "Config saved to NVS");
     else
         ESP_LOGE(TAG, "Config save failed, in-memory state rolled back: %s", esp_err_to_name(err));
-    /* FIX (L29): wipe the captured plaintext password. */
+    /* Wipe the captured plaintext password (L29). */
     memset(old_pass, 0, sizeof(old_pass));
     return err;
 }
@@ -393,15 +670,12 @@ esp_err_t config_set_hostname(const char *hostname)
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
               (c >= '0' && c <= '9') || c == '-'))
         {
-            ESP_LOGE(TAG, "Invalid hostname char '%c' (0x%02X)", c, (unsigned char)c);
+            ESP_LOGE(TAG, "Invalid hostname char '%c' (0x%02X)", c, (unsigned)c);
             return ESP_ERR_INVALID_ARG;
         }
     }
-    /* FIX (GROK-39): RFC 952/1123 also forbid a leading or trailing
-     * hyphen (some DNS resolvers and DHCP servers reject "-audio" or
-     * "audio-"). Pure-numeric hostnames ("12345") are technically
-     * allowed by RFC 1123 but break mDNS discovery on some platforms
-     * and are usually user error. Reject both. */
+    /* Reject leading/trailing hyphen and pure-numeric (GROK-39): RFC 952/1123
+     * forbid the former; the latter breaks mDNS on some platforms. */
     if (hostname[0] == '-' || hostname[strlen(hostname) - 1] == '-')
     {
         ESP_LOGE(TAG, "Invalid hostname: must not start or end with '-'");
@@ -421,19 +695,18 @@ esp_err_t config_set_hostname(const char *hostname)
         if (!has_alpha)
         {
             ESP_LOGE(TAG, "Invalid hostname: must contain at least one letter "
-                     "(pure-numeric hostnames break mDNS on some platforms)");
+                          "(pure-numeric hostnames break mDNS on some platforms)");
             return ESP_ERR_INVALID_ARG;
         }
     }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    /* Bail out if mutex not initialized (AUDIT-H17). */
     if (!s_mutex)
     {
         ESP_LOGE(TAG, "config mutex not initialized");
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
+    /* Rollback on NVS save failure (GROK-G11-18). */
     char old_hostname[sizeof(s_config.hostname)];
     memcpy(old_hostname, s_config.hostname, sizeof(old_hostname));
     strncpy(s_config.hostname, hostname, sizeof(s_config.hostname) - 1);
@@ -449,362 +722,82 @@ esp_err_t config_set_hostname(const char *hostname)
     return err;
 }
 
+/* ---- Numeric setters: thin wrappers over config_set_field (R2-B) ----
+ *
+ * Each wrapper preserves the public signature from config_mgr.h and delegates
+ * to the table-driven config_set_field, which performs validate -> lock ->
+ * snapshot -> modify -> save -> rollback -> log. */
+
 esp_err_t config_set_tx_power(uint8_t tx_power)
 {
-    if (tx_power > WIFI_TX_POWER_MAX)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.tx_power;
-    s_config.tx_power = tx_power;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.tx_power = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS");
-    else
-        ESP_LOGW(TAG, "Config save FAILED (tx_power) - rolled back");
-    return err;
+    return config_set_field(FIELD_TX_POWER, (uint32_t)tx_power);
 }
 
 esp_err_t config_set_svc_port(uint16_t port)
 {
-    if (port == 0)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint16_t old_val = s_config.svc_port;
-    s_config.svc_port = port;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.svc_port = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS");
-    else
-        ESP_LOGW(TAG, "Config save FAILED (svc_port) - rolled back");
-    return err;
+    return config_set_field(FIELD_SVC_PORT, port);
 }
 
 esp_err_t config_set_sample_rate(uint32_t rate)
 {
-    if (!sample_rate_is_valid(rate))
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint32_t old_val = s_config.sample_rate;
-    s_config.sample_rate = rate;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.sample_rate = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS");
-    else
-        ESP_LOGW(TAG, "Config save FAILED (sample_rate) - rolled back");
-    return err;
+    return config_set_field(FIELD_SAMPLE_RATE, rate);
 }
 
 esp_err_t config_set_bits_per_sample(uint8_t bits)
 {
-    if (bits != 16 && bits != 24)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.bits_per_sample;
-    s_config.bits_per_sample = bits;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.bits_per_sample = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS");
-    else
-        ESP_LOGW(TAG, "Config save FAILED (bits_per_sample) - rolled back");
-    return err;
+    return config_set_field(FIELD_BITS_PER_SAMPLE, bits);
 }
 
 esp_err_t config_set_comm_format(uint8_t fmt)
 {
-    if (fmt != I2S_CFMT_PHILIPS && fmt != I2S_CFMT_LSB)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.comm_format;
-    s_config.comm_format = fmt;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.comm_format = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS");
-    else
-        ESP_LOGW(TAG, "Config save FAILED (comm_format) - rolled back");
-    return err;
+    return config_set_field(FIELD_COMM_FORMAT, fmt);
 }
 
 esp_err_t config_set_channel_format(uint8_t fmt)
 {
-    if (fmt != I2S_CHFMT_LEFT && fmt != I2S_CHFMT_RIGHT && fmt != I2S_CHFMT_STEREO)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.channel_format;
-    s_config.channel_format = fmt;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.channel_format = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS");
-    else
-        ESP_LOGW(TAG, "Config save FAILED (channel_format) - rolled back");
-    return err;
+    return config_set_field(FIELD_CHANNEL_FORMAT, fmt);
 }
 
 esp_err_t config_set_gain(uint8_t gain)
 {
-    if (gain > 64)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): snapshot old value for rollback on NVS save
-     * failure. Without this, RAM=new value, NVS=old value -> AT+GAIN?
-     * shows new value but reboot loads old value from NVS -> "magic
-     * rollback" after reboot, confusing the user. Mirrors FIX (M21)
-     * pattern used by config_set_wifi. */
-    uint8_t old_gain = s_config.gain;
-    s_config.gain = gain;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.gain = old_gain;  /* rollback */
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS (gain=%u)", (unsigned)gain);
-    else
-        ESP_LOGW(TAG, "Config save FAILED (gain=%u) - rolled back to %u",
-                 (unsigned)gain, (unsigned)old_gain);
-    return err;
+    return config_set_field(FIELD_GAIN, gain);
 }
 
 esp_err_t config_set_agc_mode(uint8_t mode)
 {
-    if (mode >= AGC_MODE_COUNT)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.agc_mode;
-    s_config.agc_mode = mode;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.agc_mode = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS (agc_mode=%u)", (unsigned)mode);
-    else
-        ESP_LOGW(TAG, "Config save FAILED (agc_mode=%u) - rolled back", (unsigned)mode);
-    return err;
+    return config_set_field(FIELD_AGC_MODE, mode);
 }
 
 esp_err_t config_set_codec_mode(uint8_t mode)
 {
-    if (mode > CODEC_MODE_PCM)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.codec_mode;
-    s_config.codec_mode = mode;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.codec_mode = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS (codec_mode=%u)", (unsigned)mode);
-    else
-        ESP_LOGW(TAG, "Config save FAILED (codec_mode=%u) - rolled back", (unsigned)mode);
-    return err;
+    return config_set_field(FIELD_CODEC_MODE, mode);
 }
 
 esp_err_t config_set_wifi_channel(uint8_t ch)
 {
-    if (ch < 1 || ch > 13)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.wifi_channel;
-    s_config.wifi_channel = ch;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.wifi_channel = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS (wifi_channel=%u)", (unsigned)ch);
-    else
-        ESP_LOGW(TAG, "Config save FAILED (wifi_channel=%u) - rolled back", (unsigned)ch);
-    return err;
+    return config_set_field(FIELD_WIFI_CHANNEL, ch);
 }
 
 esp_err_t config_set_transport_mode(uint8_t mode)
 {
-    if (mode > TRANSPORT_MODE_RAWTX)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_val = s_config.transport_mode;
-    s_config.transport_mode = mode;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-        s_config.transport_mode = old_val;
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS (transport_mode=%u)", (unsigned)mode);
-    else
-        ESP_LOGW(TAG, "Config save FAILED (transport_mode=%u) - rolled back", (unsigned)mode);
-    return err;
+    return config_set_field(FIELD_TRANSPORT_MODE, mode);
 }
 
+/* i2s_timing: 3 fields applied atomically with one mutex take / one NVS save
+ * / one rollback. Calling config_set_field 3× would triple the NVS writes and
+ * break atomicity (a mid-batch save failure would leave sd_delay already
+ * persisted but ws_delay/bck_delay rolled back). config_set_fields validates
+ * all 3 up-front, snapshots the whole struct, and rolls back as a unit. */
 esp_err_t config_set_i2s_timing(uint8_t sd_delay, uint8_t ws_delay, uint8_t bck_delay)
 {
-    if (sd_delay > I2S_TIMING_DELAY_MAX ||
-        ws_delay > I2S_TIMING_DELAY_MAX ||
-        bck_delay > I2S_TIMING_DELAY_MAX)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
-    if (!s_mutex)
-    {
-        ESP_LOGE(TAG, "config mutex not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* FIX (GROK-G11-18): rollback on NVS save failure. */
-    uint8_t old_sd  = s_config.i2s_timing_sd_delay;
-    uint8_t old_ws  = s_config.i2s_timing_ws_delay;
-    uint8_t old_bck = s_config.i2s_timing_bck_delay;
-    s_config.i2s_timing_sd_delay  = sd_delay;
-    s_config.i2s_timing_ws_delay  = ws_delay;
-    s_config.i2s_timing_bck_delay = bck_delay;
-    esp_err_t err = save_locked();
-    if (err != ESP_OK)
-    {
-        s_config.i2s_timing_sd_delay  = old_sd;
-        s_config.i2s_timing_ws_delay  = old_ws;
-        s_config.i2s_timing_bck_delay = old_bck;
-    }
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS (i2s_timing: sd=%u ws=%u bck=%u)",
-                 (unsigned)sd_delay, (unsigned)ws_delay, (unsigned)bck_delay);
-    else
-        ESP_LOGW(TAG, "Config save FAILED (i2s_timing) - rolled back");
-    return err;
+    const field_id_t ids[3] = {FIELD_I2S_TIMING_SD, FIELD_I2S_TIMING_WS, FIELD_I2S_TIMING_BCK};
+    const uint32_t vals[3] = {sd_delay, ws_delay, bck_delay};
+    return config_set_fields(ids, vals, 3);
 }
 
 esp_err_t config_factory_reset(void)
 {
-    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
-     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    /* Bail out if mutex not initialized (AUDIT-H17). */
     if (!s_mutex)
     {
         ESP_LOGE(TAG, "config mutex not initialized");
@@ -812,8 +805,76 @@ esp_err_t config_factory_reset(void)
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     set_defaults(&s_config);
+
+    /* Erase ALL keys in the namespace before saving defaults (2-E MEDIUM #33):
+     * without nvs_erase_all, keys from older firmware versions remain as
+     * orphans in NVS — they consume flash pages and can confuse a future
+     * firmware downgrade that expects the old key. nvs_erase_all wipes every
+     * key in the namespace atomically; the subsequent save_locked() writes a
+     * clean set of defaults. */
+    nvs_handle h;
+    esp_err_t open_err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (open_err == ESP_OK)
+    {
+        /* On nvs_erase_all failure, do NOT return early (4-C MEDIUM #12):
+         * set_defaults(&s_config) already ran, so the in-memory config IS the
+         * defaults. Returning here would leave in-memory = defaults but NVS =
+         * old values (desync). Instead, fall through to save_locked() which
+         * writes the in-memory defaults to NVS, achieving the same end state. */
+        esp_err_t erase_err = nvs_erase_all(h);
+        if (erase_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "nvs_erase_all failed: %s — will save defaults explicitly",
+                     esp_err_to_name(erase_err));
+            nvs_close(h);
+            /* Fall through to save_locked() to persist the in-memory defaults. */
+        }
+        else
+        {
+            esp_err_t commit_err = nvs_commit(h);
+            if (commit_err != ESP_OK)
+            {
+                /* Log but fall through to save_locked (6-C MED #1): flash may
+                 * still be writable, and skipping it would leave in-memory =
+                 * defaults but NVS = old values (the desync 4-C MEDIUM #12 was
+                 * supposed to prevent). save_locked() opens its own handle, so
+                 * closing here is safe. The mutex is given once after
+                 * save_locked() returns. */
+                ESP_LOGE(TAG, "nvs_commit after erase failed: %s — continuing with save_locked",
+                         esp_err_to_name(commit_err));
+                nvs_close(h);
+                /* Don't return — fall through to save_locked to persist defaults */
+            }
+            else
+            {
+                nvs_close(h);
+                ESP_LOGI(TAG, "Factory reset - NVS namespace erased (orphan keys removed)");
+            }
+        }
+    }
+    else
+    {
+        /* If we can't open the namespace to erase, log but continue with
+         * save_locked() — it will open its own handle and overwrite the known
+         * keys. Orphan keys remain, but the reset still succeeds for the
+         * known fields. */
+        ESP_LOGW(TAG, "nvs_open for erase failed (%s) - continuing with save_locked",
+                 esp_err_to_name(open_err));
+    }
+
+    /* Gate the success log on save_locked()'s return value (4-C LOW):
+     * previously "Factory reset - defaults restored" was logged even when
+     * save_locked() failed (NVS NOT actually reset), misleading the log. */
     esp_err_t err = save_locked();
     xSemaphoreGive(s_mutex);
-    ESP_LOGI(TAG, "Factory reset - defaults restored");
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Factory reset - defaults restored");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Factory reset FAILED to persist defaults: %s",
+                 esp_err_to_name(err));
+    }
     return err;
 }

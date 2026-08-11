@@ -30,10 +30,9 @@
 #include "svc_port.h"
 #include "svc_protocol.h"
 #include "config_mgr.h"
-#include "stream_mode.h"   /* FIX (AUDIT-XPORT-AUTOAPPLY): stream_mode_current_transport() */
-#include "lwip/def.h" /* ntohs() */
-
-extern uint32_t streaming_get_frame_ms(void);
+#include "stream_mode.h"    /* FIX (AUDIT-XPORT-AUTOAPPLY): stream_mode_current_transport() */
+#include "stream_control.h" /* FIX (LOW): streaming_get_frame_ms / streaming_get_channels / streaming_frame_ms_known — replaces the extern decls. */
+#include "lwip/def.h"       /* ntohs() */
 
 static const char *TAG = "svc_port";
 
@@ -47,21 +46,24 @@ typedef enum
 
 /* ---- Module state ---- */
 static int s_sock = -1;
-static uint16_t s_port = 0;  /* bound port (for reinit after WiFi reconnect) */
+static uint16_t s_port = 0; /* bound port (for reinit after WiFi reconnect) */
 static SemaphoreHandle_t s_mutex = NULL;
+static SemaphoreHandle_t s_reinit_mutex = NULL;
+
 static svc_state_t s_state = SVC_STOPPED;
 static TaskHandle_t s_task_handle = NULL;
 static uint32_t s_packets_sent = 0;
 
-static uint8_t s_channels = AUDIO_CHANNELS;
-static uint8_t s_error_code = SVC_ERR_NONE;
+/* FIX (F2-SVC #11): the s_channels static is GONE — it was write-only
+ * dead state. build_info_payload() uses streaming_get_channels()
+ * directly (since the B3/channels-desync fix), so the value set here
+ * was never read. svc_port_set_channels() is kept as a no-op for API
+ * compatibility with stream_mode.c / at_handlers.c callers. */
+static volatile uint8_t s_error_code = SVC_ERR_NONE;
+static bool s_watchdog_fired = false; /* L8: one-shot log suppression */
 static uint16_t s_seq_counter = 0;
 
-/* FIX (GROK-19): pending error to be reported by the svc_task on its next
- * 100 ms loop iteration, instead of doing a synchronous UDP send_info()
- * from the audio path (i2s_task_fn / stream_task_fn). The old code took
- * s_mutex twice + did a sendto() with up to UDP_SEND_TIMEOUT_MS (2 s)
- * latency ON THE AUDIO TASK's stack, causing jitter/underruns. */
+/* FIX (GROK-19): see FIXES.md */
 static volatile uint8_t s_error_pending = SVC_ERR_NONE;
 
 static ip_addr_t s_server_ip; /* audio destination */
@@ -73,7 +75,6 @@ static uint8_t s_mac[6];
 static ip_addr_t s_broadcast_addr;
 
 static EventGroupHandle_t s_stream_evt_grp = NULL;
-static SemaphoreHandle_t s_stop_done_sem = NULL;
 
 static TickType_t s_last_discover_ticks = 0;
 
@@ -87,7 +88,6 @@ static void handle_discover(const svc_header_t *hdr,
 static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
                              const ip_addr_t *src_addr, uint16_t src_port);
 
-
 static void handle_stop(const svc_header_t *hdr,
                         const ip_addr_t *src_addr, uint16_t src_port);
 static void send_info(uint16_t req_seq, const ip_addr_t *dest, uint16_t port);
@@ -96,6 +96,8 @@ static void send_to(const uint8_t *data, size_t len,
                     const ip_addr_t *dest, uint16_t port);
 static TickType_t now_ticks(void);
 
+static esp_err_t svc_port_reinit_socket_impl(void);
+
 /* ---- Helpers ---- */
 
 static TickType_t now_ticks(void)
@@ -103,7 +105,27 @@ static TickType_t now_ticks(void)
     return xTaskGetTickCount();
 }
 
-static void update_broadcast_addr(void)
+/* Atomically reserve and return the next INFO sequence number. */
+static uint16_t next_info_seq(void)
+{
+    uint16_t seq;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    seq = s_seq_counter++;
+    xSemaphoreGive(s_mutex);
+    return seq;
+}
+
+/* FIX (F-A #7): compute the subnet-directed broadcast address from
+ * the current STA IP/netmask. Pure helper — does NOT touch
+ * s_broadcast_addr. Callers must store the result under s_mutex so the
+ * announce loop in svc_task_fn (which reads s_broadcast_addr under
+ * s_mutex) sees a consistent value.
+ *
+ * If WiFi has no IP yet (netif not ready), falls back to IPADDR_BROADCAST
+ * (255.255.255.255). This is safe but less efficient — announce packets
+ * flood the entire L2 segment instead of the local subnet. Updated to
+ * subnet-directed broadcast once IP is acquired (called on GOT_IP). */
+static void compute_broadcast_addr(ip_addr_t *out)
 {
     tcpip_adapter_ip_info_t ip_info;
     if (tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info) == ESP_OK)
@@ -112,22 +134,62 @@ static void update_broadcast_addr(void)
         ip.addr = ip_info.ip.addr;
         mask.addr = ip_info.netmask.addr;
         /* Subnet-directed broadcast: IP | ~netmask */
-        s_broadcast_addr.addr = ip.addr | ~mask.addr;
-        ESP_LOGI(TAG, "Broadcast: " IPSTR " (from " IPSTR "/" IPSTR ")",
-                 IP2STR(&s_broadcast_addr), IP2STR(&ip), IP2STR(&mask));
+        out->addr = ip.addr | ~mask.addr;
+        /* Logging moved to update_broadcast_addr (only logs on change). */
     }
     else
     {
-        s_broadcast_addr.addr = IPADDR_BROADCAST;
-        ESP_LOGW(TAG, "No IP yet, using 255.255.255.255 for broadcast");
+        out->addr = IPADDR_BROADCAST;
+        /* Logging moved to update_broadcast_addr. */
+    }
+}
+
+/* Refresh s_broadcast_addr from the current STA IP/netmask.
+ * FIX (F-A #7): the s_broadcast_addr write happens under s_mutex so
+ * concurrent readers (svc_task_fn announce loop) see a consistent
+ * value. */
+static void update_broadcast_addr(void)
+{
+    ip_addr_t computed;
+    compute_broadcast_addr(&computed);
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        /* Only log if the broadcast address actually changed (avoids duplicate
+         * log lines when GOT_IP handler and reinit_socket both call this). */
+        if (s_broadcast_addr.addr != computed.addr)
+        {
+            s_broadcast_addr = computed;
+            if (computed.addr == IPADDR_BROADCAST)
+            {
+                ESP_LOGW(TAG, "No IP yet, using 255.255.255.255 for broadcast");
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Broadcast: " IPSTR, IP2STR(&computed));
+            }
+        }
+        xSemaphoreGive(s_mutex);
+    }
+    else
+    {
+        s_broadcast_addr = computed;
     }
 }
 
 /* ---- Public API ---- */
-
 esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
 {
-    if (s_state != SVC_STOPPED)
+    bool already_running;
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+        already_running = (s_state != SVC_STOPPED);
+        xSemaphoreGive(s_mutex);
+    }
+    else
+    {
+        already_running = (s_state != SVC_STOPPED);
+    }
+    if (already_running)
     {
         ESP_LOGW(TAG, "Already running");
         return ESP_ERR_INVALID_STATE;
@@ -137,23 +199,20 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
     s_stream_evt_grp = (EventGroupHandle_t)stream_evt_grp;
 
     s_mutex = xSemaphoreCreateMutex();
-    s_stop_done_sem = xSemaphoreCreateBinary();
-    if (!s_mutex || !s_stop_done_sem)
+    if (!s_mutex)
     {
-        ESP_LOGE(TAG, "Failed to create sync primitives");
-        /* FIX (GROK-4b): if one primitive succeeded but the other failed,
-         * the successful one must be deleted to avoid an 80-120 byte RAM
-         * leak per failed init (the next init overwrites the handles). */
-        if (s_mutex)        { vSemaphoreDelete(s_mutex);        s_mutex = NULL; }
-        if (s_stop_done_sem){ vSemaphoreDelete(s_stop_done_sem); s_stop_done_sem = NULL; }
-        return ESP_ERR_NO_MEM;
+        ESP_LOGE(TAG, "Failed to create mutex");
+        goto init_fail;
     }
 
-    /* Get MAC address.
-     * FIX (AUDIT-LOW): check the return - if WiFi is not yet initialized
-     * when svc_port_init runs, s_mac stays all-zeros and INFO packets
-     * report MAC 00:00:00:00:00:00, which receivers may reject or log
-     * as malformed. */
+    /* SINGLE-FLIGHT: create the reinit guard mutex. */
+    s_reinit_mutex = xSemaphoreCreateMutex();
+    if (!s_reinit_mutex)
+    {
+        ESP_LOGE(TAG, "Failed to create reinit mutex");
+        goto init_fail;
+    }
+
     esp_err_t mac_err = esp_wifi_get_mac(ESP_IF_WIFI_STA, s_mac);
     if (mac_err != ESP_OK)
     {
@@ -169,64 +228,52 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
 
     update_broadcast_addr();
 
-    /* Create socket. */
     s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s_sock < 0)
     {
         ESP_LOGE(TAG, "socket failed: errno=%d", errno);
-        /* FIX (S7): cleanup sync primitives on error. */
-        if (s_mutex)        { vSemaphoreDelete(s_mutex);        s_mutex = NULL; }
-        if (s_stop_done_sem){ vSemaphoreDelete(s_stop_done_sem); s_stop_done_sem = NULL; }
-        return ESP_FAIL;
+        goto init_fail;
     }
 
-    /* FIX (S3): set SO_REUSEADDR / SO_BROADCAST BEFORE bind(). Setting
-     * SO_REUSEADDR after bind() has no effect on the current socket's bind
-     * (it only affects future sockets). The whole point is to survive quick
-     * stop->start cycles without EADDRINUSE. */
+#ifdef CONFIG_LWIP_SO_REUSE
     int enable = 1;
     setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
-    setsockopt(s_sock, SOL_SOCKET, SO_BROADCAST, &enable, sizeof(enable));
+#endif
 
-    /* Bind to service port. */
     struct sockaddr_in bind_addr;
     memset(&bind_addr, 0, sizeof(bind_addr));
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_port = htons(port);
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
     if (bind(s_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
     {
         ESP_LOGE(TAG, "bind failed: errno=%d", errno);
-        close(s_sock);
-        s_sock = -1;
-        if (s_mutex)        { vSemaphoreDelete(s_mutex);        s_mutex = NULL; }
-        if (s_stop_done_sem){ vSemaphoreDelete(s_stop_done_sem); s_stop_done_sem = NULL; }
-        return ESP_FAIL;
+        goto init_fail;
     }
 
-    /* Receive timeout - CRITICAL: without this, recvfrom blocks forever
-     * and the periodic announce/watchdog code after it NEVER runs.
-     * 200ms timeout lets the task loop through announcements ~5x/sec. */
-    struct timeval tv_rcv = {.tv_sec = 0, .tv_usec = 200 * 1000};
+#if CFG_UDP_RECEIVE_TIMEOUT_MS_ENABLED
+    struct timeval tv_rcv = {.tv_sec = UDP_RECEIVE_TIMEOUT_MS / 1000,
+                             .tv_usec = (UDP_RECEIVE_TIMEOUT_MS % 1000) * 1000};
     setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_rcv, sizeof(tv_rcv));
+#endif
 
-    /* Send timeout. */
+#if CFG_UDP_SEND_TIMEOUT_MS_ENABLED
     struct timeval tv_snd = {.tv_sec = UDP_SEND_TIMEOUT_MS / 1000,
                              .tv_usec = (UDP_SEND_TIMEOUT_MS % 1000) * 1000};
     setsockopt(s_sock, SOL_SOCKET, SO_SNDTIMEO, &tv_snd, sizeof(tv_snd));
+#endif
 
-    /* Create task.
-     *
-     * FIX (GROK-3.2): set s_state = SVC_IDLE HERE (under mutex, BEFORE
-     * xTaskCreate) so that svc_port_is_running() returns true immediately
-     * after init returns. Previously s_state was set to SVC_IDLE only
-     * inside svc_task_fn (line ~1032) after the task started running,
-     * leaving a window where a second svc_port_init() call would pass
-     * the "s_state != SVC_STOPPED" guard (line ~130) and create a
-     * duplicate socket + task. The task's own s_state = SVC_IDLE at
-     * line ~1032 now becomes a redundant no-op (safe). */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_server_ip.addr = 0;
+    s_server_port = 0;
+    s_server_svc_addr.addr = 0;
+    s_server_svc_port = 0;
+    s_packets_sent = 0;
+    s_error_code = 0;
+    s_error_pending = SVC_ERR_NONE;
+    s_last_discover_ticks = 0;
+    s_no_route_logged = false;
+    s_seq_counter = 0;
     s_state = SVC_IDLE;
     xSemaphoreGive(s_mutex);
 
@@ -235,27 +282,42 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
     if (res != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to create task");
-        close(s_sock);
-        s_sock = -1;
-        /* FIX (GROK-4): leak sync primitives on this error path too.
-         * Without this, every failed init orphaned ~80-120 bytes of
-         * FreeRTOS heap (mutex + binary semaphore), eventually exhausting
-         * RAM on a memory-constrained ESP8266 with repeated re-init. */
-        if (s_mutex)        { vSemaphoreDelete(s_mutex);        s_mutex = NULL; }
-        if (s_stop_done_sem){ vSemaphoreDelete(s_stop_done_sem); s_stop_done_sem = NULL; }
-        return ESP_ERR_NO_MEM;
+        goto init_fail;
     }
 
-    ESP_LOGI(TAG, "Service port active on UDP:%u (audio: %d ms, rate from config)",
-             (unsigned)port, streaming_get_frame_ms());
+    uint32_t boot_frame_ms = streaming_frame_ms_known()
+                                 ? streaming_get_frame_ms()
+                                 : 0;
+    ESP_LOGI(TAG, "Service port active on UDP:%u (audio: %u ms%s, rate from config)",
+             (unsigned)port, (unsigned)boot_frame_ms,
+             boot_frame_ms == 0 ? " (not yet computed)" : "");
     return ESP_OK;
+
+init_fail:
+    s_state = SVC_STOPPED;
+    s_task_handle = NULL;
+    if (s_sock >= 0)
+    {
+        close(s_sock);
+        s_sock = -1;
+    }
+    if (s_mutex)
+    {
+        vSemaphoreDelete(s_mutex);
+        s_mutex = NULL;
+    }
+    /* SINGLE-FLIGHT: clean up reinit mutex on init failure. */
+    if (s_reinit_mutex)
+    {
+        vSemaphoreDelete(s_reinit_mutex);
+        s_reinit_mutex = NULL;
+    }
+    return ESP_FAIL;
 }
 
 bool svc_port_is_running(void)
 {
-    /* FIX (AUDIT-H6): read s_state under the mutex for acquire/release
-     * semantics. svc_task_fn reads s_state under the mutex; an unsynchronized
-     * read here could observe a stale value during a state transition. */
+    /* FIX (AUDIT-H6): see FIXES.md — read s_state under the mutex. */
     bool running = false;
     if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
     {
@@ -264,157 +326,34 @@ bool svc_port_is_running(void)
     }
     else
     {
-        /* Best-effort fallback if mutex is contended (e.g. deinit holds it). */
-        running = (s_state != SVC_STOPPED);
+        running = (s_state != SVC_STOPPED); /* best-effort fallback */
     }
     return running;
 }
 
-/* FIX (H7): full teardown of the service port. Used when switching to a
- * transport that doesn't use svc_port (e.g. RAWTX). Closes the socket,
- * signals the task to exit, waits for it, frees sync primitives. */
-void svc_port_deinit(void)
-{
-    /* FIX (GROK-G11-4): take the mutex for the s_state read + write.
-     * Previously s_state = SVC_STOPPED was written WITHOUT the mutex while
-     * svc_task_fn reads s_state UNDER the mutex (line ~1046) — a data race
-     * (C11/TSAN would flag it). Practically benign on ESP8266 (32-bit
-     * aligned enum = atomic read/write), but this closes the consistency
-     * hole and matches the project's own discipline. */
-    if (!s_mutex)
-        return;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_state == SVC_STOPPED)
-    {
-        xSemaphoreGive(s_mutex);
-        return;
-    }
-    s_state = SVC_STOPPED;
-    xSemaphoreGive(s_mutex);
-
-    /* Close socket - wakes any recvfrom() in the svc task (EBADF). */
-    if (s_sock >= 0)
-    {
-        shutdown(s_sock, SHUT_RDWR);
-        close(s_sock);
-        s_sock = -1;
-    }
-
-    /* Wait for the task to exit (it polls s_state and breaks out of the
-     * loop on SVC_STOPPED). FIX (FW#4): increased from 500ms to 3s.
-     * The task may be inside recvfrom (200ms timeout) or inside
-     * sendto/build_info. 500ms was too tight if a recvfrom just started.
-     * Force-deleting a task inside lwIP orphans the lwIP mutex ->
-     * all future socket calls deadlock. 3s covers 15 recvfrom cycles. */
-    if (s_task_handle)
-    {
-        for (int i = 0; i < 30 && s_task_handle; i++)
-            vTaskDelay(pdMS_TO_TICKS(100));
-        if (s_task_handle)
-        {
-            ESP_LOGW(TAG, "svc_port: task did not exit in 3s - force-deleting "
-                     "(may orphan lwIP mutex - reboot recommended)");
-            vTaskDelete(s_task_handle);
-            s_task_handle = NULL;
-        }
-    }
-
-    if (s_mutex)
-    {
-        vSemaphoreDelete(s_mutex);
-        s_mutex = NULL;
-    }
-    if (s_stop_done_sem)
-    {
-        vSemaphoreDelete(s_stop_done_sem);
-        s_stop_done_sem = NULL;
-    }
-}
-
-/* Re-create the UDP socket after WiFi reconnect.
- *
- * ROOT CAUSE: when WiFi disconnects, lwIP destroys the netif structure. The
- * old socket (s_sock) becomes a "zombie" — bound to a destroyed interface.
- * After reconnect, sendto() on the zombie socket fails with ENETUNREACH
- * (errno 113) or silently drops packets. Broadcast announcements (INFO) stop
- * working → the receiver can no longer discover the ESP.
- *
- * Fix: on IP_EVENT_STA_GOT_IP (new IP obtained), wifi_sta.c calls this to
- * close the stale socket and open a fresh one bound to the same port. The
- * svc_port task keeps running — only the underlying fd is swapped.
- *
- * See: github.com/esp8266/Arduino#888 ("you need to reopen the UDP socket
- * after a Wifi disconnect"), github.com/esp8266/Arduino#969 ("interface
- * structure is destroyed").
- *
- * Thread-safety: called from the event-loop task (GOT_IP handler). The svc
- * task may be in recvfrom() on the old fd — close() wakes it (EBADF), it
- * loops back, sees the new fd. The mutex guards the fd swap. */
+/* SINGLE-FLIGHT: public entry point. Takes s_reinit_mutex with timeout=0
+ * (try-lock). If another reinit is already in progress, returns ESP_OK
+ * immediately ("someone else is handling it"). This prevents
+ * wifi_reconnect_task and svc_task_fn periodic retry from both creating
+ * sockets and leaking one of them. */
 esp_err_t svc_port_reinit_socket(void)
 {
-    if (s_state == SVC_STOPPED)
+    if (!s_reinit_mutex)
+    {
+        ESP_LOGE(TAG, "reinit: reinit_mutex not created");
         return ESP_ERR_INVALID_STATE;
-    if (s_port == 0)
-        return ESP_ERR_INVALID_STATE;
-
-    ESP_LOGI(TAG, "Reinitializing UDP socket after WiFi reconnect (port %u)",
-             (unsigned)s_port);
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-
-    /* Close the stale socket (bound to the destroyed netif). */
-    int old_sock = s_sock;
-    s_sock = -1;
-    if (old_sock >= 0)
-    {
-        shutdown(old_sock, SHUT_RDWR);
-        close(old_sock);
     }
 
-    /* Create a fresh socket bound to the same port on the new netif. */
-    int new_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (new_sock < 0)
+    if (xSemaphoreTake(s_reinit_mutex, 0) != pdTRUE)
     {
-        ESP_LOGE(TAG, "reinit: socket failed: errno=%d", errno);
-        xSemaphoreGive(s_mutex);
-        return ESP_FAIL;
+        ESP_LOGW(TAG, "reinit: already in progress - skipping");
+        return ESP_OK;
     }
 
-    /* FIX (S3): set SO_REUSEADDR / SO_BROADCAST BEFORE bind() (mirroring
-     * the fix in svc_port_init). Setting them after bind has no effect on
-     * the current socket. */
-    int enable = 1;
-    setsockopt(new_sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
-    setsockopt(new_sock, SOL_SOCKET, SO_BROADCAST, &enable, sizeof(enable));
+    esp_err_t err = svc_port_reinit_socket_impl();
 
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(s_port);
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(new_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
-    {
-        ESP_LOGE(TAG, "reinit: bind failed: errno=%d", errno);
-        close(new_sock);
-        xSemaphoreGive(s_mutex);
-        return ESP_FAIL;
-    }
-    struct timeval tv_rcv = {.tv_sec = 0, .tv_usec = 200 * 1000};
-    setsockopt(new_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_rcv, sizeof(tv_rcv));
-    struct timeval tv_snd = {.tv_sec = UDP_SEND_TIMEOUT_MS / 1000,
-                             .tv_usec = (UDP_SEND_TIMEOUT_MS % 1000) * 1000};
-    setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &tv_snd, sizeof(tv_snd));
-
-    s_sock = new_sock;
-    s_no_route_logged = false;  /* reset suppression — new socket, new chance */
-
-    /* Refresh the broadcast address (netif changed → subnet may differ). */
-    update_broadcast_addr();
-
-    xSemaphoreGive(s_mutex);
-
-    ESP_LOGI(TAG, "UDP socket reinitialized (fd %d -> %d)", old_sock, new_sock);
-    return ESP_OK;
+    xSemaphoreGive(s_reinit_mutex);
+    return err;
 }
 
 void svc_port_notify_streaming_started(void)
@@ -424,11 +363,7 @@ void svc_port_notify_streaming_started(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_state = SVC_STREAMING;
     s_last_discover_ticks = now_ticks();
-    /* FIX (AUDIT-MEDIUM): clear any stale error code from a previous stream
-     * (e.g. SVC_ERR_WATCHDOG from a watchdog timeout). Without this, INFO
-     * packets would report ERROR indefinitely after a single watchdog
-     * event - the receiver may refuse to reconfigure a device reporting
-     * ERROR. A fresh stream start means the device is healthy again. */
+    /* FIX (AUDIT-MEDIUM): see FIXES.md */
     s_error_code = SVC_ERR_NONE;
     xSemaphoreGive(s_mutex);
     ESP_LOGI(TAG, "Streaming started - DISCOVER watchdog active (%d s timeout), "
@@ -443,6 +378,7 @@ void svc_port_notify_streaming_stopped(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_state = SVC_IDLE;
     xSemaphoreGive(s_mutex);
+    s_watchdog_fired = false; /* L8: reset for next stream */
     ESP_LOGI(TAG, "Streaming stopped - announcements resumed");
 }
 
@@ -450,8 +386,7 @@ void svc_port_reset_watchdog(void)
 {
     if (!s_mutex)
         return;
-    /* FIX C2: timeout instead of portMAX_DELAY to avoid deadlock if the
-     * mutex was orphaned by a force-deleted task. */
+    /* FIX (C2): see FIXES.md */
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
     {
         ESP_LOGW(TAG, "reset_watchdog: mutex timeout - skipping");
@@ -468,21 +403,14 @@ void svc_port_reset_watchdog(void)
 
 void svc_port_notify_stop_complete(void)
 {
-    if (!s_mutex)
-        return;
-    if (s_stop_done_sem)
-    {
-        xSemaphoreGive(s_stop_done_sem);
-    }
+    /* No-op: stop completion detected via streaming_is_active() in handle_configure. */
 }
 
 void svc_port_update_stats(uint32_t packets_sent)
 {
     if (!s_mutex)
         return;
-    /* FIX (C2): Use timeout instead of portMAX_DELAY. If a force-deleted
-     * task orphaned this mutex, portMAX_DELAY would deadlock forever.
-     * With 100ms timeout we just skip the stats update on contention. */
+    /* FIX (C2): see FIXES.md */
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
     {
         ESP_LOGW(TAG, "update_stats: mutex timeout - skipping");
@@ -507,8 +435,7 @@ bool svc_port_get_stream_dest(uint32_t *host, uint16_t *port)
     return valid;
 }
 
-/* FIX (H1): expose the server's service-channel IP so the TCP accept task
- * can refuse unauthorized clients. */
+/* FIX (H1): see FIXES.md */
 bool svc_port_get_server_ip(uint32_t *ip)
 {
     if (!ip || !s_mutex)
@@ -523,25 +450,11 @@ bool svc_port_get_server_ip(uint32_t *ip)
 
 void svc_port_set_channels(uint8_t channels)
 {
-    if (!s_mutex)
-        return;
-    if (channels < 1)
-        channels = 1;
-    if (channels > 2)
-        channels = 2;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_channels = channels;
-    xSemaphoreGive(s_mutex);
-}
-
-uint8_t svc_port_get_channels(void)
-{
-    if (!s_mutex)
-        return s_channels;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    uint8_t ch = s_channels;
-    xSemaphoreGive(s_mutex);
-    return ch;
+    /* FIX (F2-SVC #11): no-op. The s_channels static was write-only dead
+     * state — build_info_payload() uses streaming_get_channels() directly
+     * (B3/channels-desync fix). Kept as a no-op for API compatibility
+     * with the stream_mode ops table and at_handlers.c callers. */
+    (void)channels;
 }
 
 void svc_port_set_error(uint8_t error_code)
@@ -549,22 +462,23 @@ void svc_port_set_error(uint8_t error_code)
     if (!s_mutex)
         return;
 
-    /* FIX (C2): timeout instead of portMAX_DELAY to avoid deadlock if
-     * the mutex was orphaned by a force-deleted task. */
+    /* FIX (C2): see FIXES.md — timeout instead of portMAX_DELAY. */
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
     {
-        ESP_LOGW(TAG, "set_error: mutex timeout - error %u not reported",
+        /* FIX (F-A #9): PARTIAL fix — best-effort volatile writes so the
+         * error is still reported. s_error_code is read under mutex by
+         * build_info_payload(); a racing read may see the old or new
+         * value (uint8_t store is atomic on Xtensa), but the worst case
+         * is one INFO packet with stale error_code, which the next INFO
+         * will correct. */
+        ESP_LOGW(TAG, "set_error: mutex timeout - error %u set best-effort",
                  (unsigned)error_code);
-        /* Still set the pending flag (lock-free) so the svc_task can
-         * eventually flush it on its next loop iteration. */
+        s_error_code = error_code; /* best-effort volatile write */
         s_error_pending = error_code;
         return;
     }
     s_error_code = error_code;
-    /* FIX (GROK-19): do NOT send_info() from this audio-path context.
-     * Set a volatile pending flag instead; the svc_task will pick it up
-     * on its next 100 ms iteration and emit the INFO packet from its
-     * own stack. This removes UDP send jitter from the i2s/TX hot path. */
+    /* FIX (GROK-19): see FIXES.md */
     s_error_pending = error_code;
     xSemaphoreGive(s_mutex);
 }
@@ -573,37 +487,93 @@ void svc_port_clear_error(void)
 {
     if (!s_mutex)
         return;
-    /* FIX (C2): timeout instead of portMAX_DELAY. This is called from
-     * udp_on_stream_started() at the end of start_streaming(). If the
-     * mutex was orphaned by a previous force-delete, portMAX_DELAY would
-     * deadlock here -> watchdog reboot after ~8s. */
+    /* FIX (C2): see FIXES.md */
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
     {
         ESP_LOGW(TAG, "clear_error: mutex timeout - error flag not cleared");
         return;
     }
     s_error_code = SVC_ERR_NONE;
-    /* FIX (GROK-3.5): also clear s_error_pending. Without this, the svc_task
-     * could flush a stale pending error on its next 100ms iteration even
-     * AFTER clear_error was called — producing an extra (unnecessary)
-     * send_info and a misleading "flushed pending error N" log line. The
-     * INFO packet itself would contain error=NONE (send_info reads
-     * s_error_code which was just cleared), but the extra UDP traffic and
-     * log noise are worth avoiding. */
+    /* FIX (GROK-3.5): see FIXES.md */
     s_error_pending = SVC_ERR_NONE;
     xSemaphoreGive(s_mutex);
+}
+
+/* FIX (F2-SVC #8): set error_code ONLY if no error is currently set.
+ * This preserves any higher-priority error (I2S, CODEC, MEMORY) already
+ * reported by an upstream task. The unconditional svc_port_set_error()
+ * above is kept for callers that explicitly want to overwrite (e.g. the
+ * watchdog path, which sets SVC_ERR_WATCHDOG unconditionally). Used by
+ * pipeline.c's stream_task_fn send-fail path so a transient NETWORK
+ * error doesn't clobber a concurrent I2S/CODEC/MEMORY error. */
+void svc_port_set_error_if_none(uint8_t error_code)
+{
+    if (!s_mutex)
+        return;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        if (s_error_code == SVC_ERR_NONE)
+        {
+            s_error_code = error_code;
+            s_error_pending = error_code;
+        }
+        xSemaphoreGive(s_mutex);
+    }
+    else
+    {
+        /* Best-effort: only set if no current error. uint8_t store is
+         * atomic on Xtensa; worst case is one INFO packet with stale
+         * error_code, which the next INFO will correct (same reasoning
+         * as the F-A #9 best-effort path in svc_port_set_error). */
+        if (s_error_code == SVC_ERR_NONE)
+        {
+            s_error_code = error_code;
+            s_error_pending = error_code;
+        }
+    }
+}
+
+/* FIX (FR-SVC #7): per-code error clearing. Clears s_error_code / s_error_pending
+ * ONLY if the currently-active error matches `error_code`. This lets callers
+ * clear a specific error (e.g. SVC_ERR_NETWORK after a successful TX) without
+ * clobbering an unrelated upstream error (e.g. SVC_ERR_I2S set by the i2s
+ * task in the meantime). The unconditional svc_port_clear_error() is kept for
+ * cases where a full clear is intentional (e.g. on streaming start). */
+void svc_port_clear_error_code(uint8_t error_code)
+{
+    if (!s_mutex)
+        return;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        if (s_error_code == error_code)
+        {
+            s_error_code = SVC_ERR_NONE;
+            s_error_pending = SVC_ERR_NONE;
+        }
+        xSemaphoreGive(s_mutex);
+    }
 }
 
 /* Called by wifi_sta.c on IP_EVENT_STA_GOT_IP to refresh broadcast addr. */
 void svc_port_update_broadcast(void)
 {
-    if (!s_mutex)
-        return;
-    /* Проверяем s_state (SVC_STOPPED = не инициализирован). */
-    if (s_state != SVC_STOPPED)
+    /* FIX (LOW #28): see FIXES.md */
+    bool running = false;
+    if (s_mutex != NULL)
     {
-        update_broadcast_addr();
+        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+        {
+            running = (s_state != SVC_STOPPED);
+            xSemaphoreGive(s_mutex);
+        }
+        else
+        {
+            running = (s_state != SVC_STOPPED); /* best-effort fallback */
+        }
     }
+    if (!running)
+        return;
+    update_broadcast_addr();
 }
 
 void svc_port_get_status(svc_port_status_t *status)
@@ -618,7 +588,20 @@ void svc_port_get_status(svc_port_status_t *status)
     status->running = (s_state != SVC_STOPPED);
     status->streaming = (s_state == SVC_STREAMING);
     status->error_code = s_error_code;
-    memcpy(status->mac, s_mac, 6);
+    /* Refresh MAC dynamically: if WiFi was not initialized when svc_port_init()
+     * ran, s_mac may still be all zeros. esp_wifi_get_mac() is cheap and safe
+     * to call here (INFO packets are sent at most a few times per second). */
+    {
+        uint8_t mac_tmp[6];
+        if (esp_wifi_get_mac(WIFI_IF_STA, mac_tmp) == ESP_OK)
+        {
+            memcpy(status->mac, mac_tmp, 6);
+        }
+        else
+        {
+            memcpy(status->mac, s_mac, 6);
+        }
+    }
     status->server_stream_ip = s_server_ip.addr;
     status->server_stream_port = s_server_port;
     status->server_svc_ip = s_server_svc_addr.addr;
@@ -642,19 +625,26 @@ void svc_port_get_status(svc_port_status_t *status)
 static void send_to(const uint8_t *data, size_t len,
                     const ip_addr_t *dest, uint16_t port)
 {
-    /* FIX (S6): snapshot s_sock under the mutex. svc_port_reinit_socket
-     * swaps s_sock under s_mutex; without this snapshot we could read
-     * s_sock=5, reinit closes 5 and recycles the fd number for a new
-     * socket, sendto(5,...) then goes on a different socket than intended
-     * (benign because dest/port are params) or on a closed fd -> EBADF. */
+    /* FIX (S6): see FIXES.md */
     if (!s_mutex)
         return;
+    if (len == 0)
+        return;
+
+    /* FIX (F-A #5): hold s_mutex ACROSS sendto() so the fd cannot be
+     * closed/swapped out from under us by svc_port_reinit_socket()
+     * (which also takes s_mutex while swapping s_sock). The previous
+     * snapshot-then-release pattern raced against reinit_socket: the
+     * fd could be close()'d between our xSemaphoreGive and the sendto,
+     * producing EBADF / use-after-close. */
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
         return;
     int sock = s_sock;
-    xSemaphoreGive(s_mutex);
-    if (sock < 0 || len == 0)
+    if (sock < 0)
+    {
+        xSemaphoreGive(s_mutex);
         return;
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -662,23 +652,23 @@ static void send_to(const uint8_t *data, size_t len,
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = dest->addr;
 
-    ssize_t sent = sendto(sock, data, len, 0,
+    /* FIX (F-A #3): MSG_DONTWAIT prevents sendto() from blocking when
+     * the socket buffer is full (no SO_SNDTIMEO configured when
+     * CFG_UDP_SEND_TIMEOUT_MS_ENABLED is unset). */
+    ssize_t sent = sendto(sock, data, len, MSG_DONTWAIT,
                           (struct sockaddr *)&addr, sizeof(addr));
+    int saved_errno = errno; /* capture before xSemaphoreGive (context switch) */
+    xSemaphoreGive(s_mutex);
     if (sent < 0)
     {
-        /* FIX (AUDIT-MEDIUM): compare against symbolic errno names instead
-         * of the magic number 118. The comment was ambiguous - on ESP8266
-         * RTOS SDK v3.4 both ENETUNREACH and EHOSTUNREACH can fire during
-         * WiFi (re)association, and the numeric value comes from newlib/lwip
-         * which can differ from Linux. Provide fallback to 118 in case the
-         * toolchain's errno.h doesn't define them (older SDKs). */
+        /* FIX (AUDIT-MEDIUM): see FIXES.md */
 #ifndef ENETUNREACH
 #define ENETUNREACH 118
 #endif
 #ifndef EHOSTUNREACH
 #define EHOSTUNREACH 118
 #endif
-        if (errno == ENETUNREACH || errno == EHOSTUNREACH)
+        if (saved_errno == ENETUNREACH || saved_errno == EHOSTUNREACH)
         {
             if (!s_no_route_logged)
             {
@@ -688,7 +678,7 @@ static void send_to(const uint8_t *data, size_t len,
         }
         else
         {
-            ESP_LOGW(TAG, "sendto failed: errno=%d", errno);
+            ESP_LOGW(TAG, "sendto failed: errno=%d", saved_errno);
         }
     }
     else
@@ -706,31 +696,21 @@ static void build_info_payload(svc_info_payload_t *info)
 
     info->codec_id = (cfg.codec_mode == CODEC_MODE_PCM) ? CODEC_ID_PCM : CODEC_ID_ADPCM;
     info->sample_rate = cfg.sample_rate;
-    info->frame_ms = streaming_get_frame_ms();
+    /* FIX (LOW #32, F-A #6): see FIXES.md — report 0 if frame_ms has
+     * not yet been computed (before the first stream starts) so INFO
+     * packets don't prematurely claim the default 20 ms. Mirrors the
+     * boot-log guard in svc_port_init. */
+    info->frame_ms = streaming_frame_ms_known()
+                         ? (uint8_t)streaming_get_frame_ms()
+                         : 0;
     info->bits_per_sample = cfg.bits_per_sample;
-    /* FIX (AUDIT-XPORT-AUTOAPPLY): report the ACTIVE transport, not the NVS
-     * value. AT+XPORT saves to NVS but does NOT switch immediately - the
-     * stream continues on the old transport until AT+HOTRESTART or AT+RST.
-     * If we reported cfg.transport_mode (NVS), the server would see the new
-     * transport while the stream is still on the old one, and could try to
-     * auto-switch (causing interruptions). By reporting the ACTIVE transport,
-     * the server always sees what's actually running. */
+    /* FIX (AUDIT-XPORT-AUTOAPPLY): see FIXES.md */
     info->transport_mode = stream_mode_current_transport();
 
-    /* FIX (B3/channels-desync + lock-ordering): read channels BEFORE taking
-     * s_mutex. streaming_get_channels() may call config_get_copy() (which
-     * takes the config_mgr mutex). Calling it under s_mutex would nest two
-     * mutexes — not a deadlock (config_mgr never calls back into svc_port),
-     * but bad lock-ordering hygiene. Reading channels here (outside s_mutex)
-     * is safe: channel count is a single uint8_t, and the brief window
-     * between this read and the mutex-protected info->channels assignment
-     * can at worst show a one-packet-stale value. */
-    extern uint8_t streaming_get_channels(void);
+    /* FIX (B3/channels-desync): see FIXES.md */
     uint8_t channels_snapshot = streaming_get_channels();
 
-    /* FIX (L22): capture s_state into a local inside the mutex and use the
-     * local after release. The previous code re-read s_state without the
-     * mutex at line 614, which could race with a concurrent state change. */
+    /* FIX (L22): see FIXES.md */
     svc_state_t state_local;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     state_local = s_state;
@@ -738,6 +718,20 @@ static void build_info_payload(svc_info_payload_t *info)
     info->error = s_error_code;
     info->packets_sent = s_packets_sent;
     info->channels = channels_snapshot;
+    /* Refresh MAC dynamically: if WiFi was not initialized when svc_port_init()
+     * ran, s_mac may still be all zeros. esp_wifi_get_mac() is cheap and safe
+     * to call here (INFO packets are sent at most a few times per second). */
+    {
+        uint8_t mac_tmp[6];
+        if (esp_wifi_get_mac(WIFI_IF_STA, mac_tmp) == ESP_OK)
+        {
+            memcpy(info->mac, mac_tmp, 6);
+        }
+        else
+        {
+            memcpy(info->mac, s_mac, 6);
+        }
+    }
     xSemaphoreGive(s_mutex);
 
     /* Only override status to ERROR when streaming.
@@ -749,7 +743,6 @@ static void build_info_payload(svc_info_payload_t *info)
         info->status = SVC_STATUS_ERROR;
     }
 
-    memcpy(info->mac, s_mac, 6);
     info->free_heap = esp_get_free_heap_size();
 
     wifi_ap_record_t ap_info;
@@ -760,10 +753,7 @@ static void build_info_payload(svc_info_payload_t *info)
     }
     info->wifi_rssi = rssi;
 
-    /* FIX (AUDIT-LOW): explicit NUL-terminate (matches the hostname pattern
-     * 3 lines below). Currently safe due to the memset(info, 0, sizeof(*info))
-     * earlier in this function, but if that memset is ever removed the
-     * strncpy could leave the field unterminated. */
+    /* FIX (AUDIT-LOW): see FIXES.md */
     strncpy(info->firmware, FIRMWARE_VERSION, sizeof(info->firmware) - 1);
     info->firmware[sizeof(info->firmware) - 1] = '\0';
 
@@ -780,16 +770,9 @@ static void send_info(uint16_t req_seq, const ip_addr_t *dest, uint16_t port)
     uint8_t buf[SVC_HEADER_SIZE + sizeof(svc_info_payload_t)];
 
     /* Use req_seq directly for the header sequence number.
-     *
-     * Callers are responsible for sourcing the seq:
-     *   - DISCOVER/CONFIGURE/STOP replies: pass the request's seq (echo)
-     *   - Periodic / error-triggered INFO: caller increments s_seq_counter
-     *     under s_mutex and passes the result.
-     *
-     * Previously send_info ALSO incremented s_seq_counter itself, causing a
-     * double increment — seq numbers jumped by 2, and reply headers never
-     * echoed the request's seq (the req_seq parameter was silently
-     * discarded). */
+     * Callers source the seq: replies echo the request's seq; periodic /
+     * error INFO uses next_info_seq(). FIX: previously send_info ALSO
+     * incremented s_seq_counter itself, causing a double increment. */
     svc_header_t hdr;
     svc_header_init(&hdr, SVC_CMD_INFO, req_seq, sizeof(svc_info_payload_t));
     memcpy(buf, &hdr, SVC_HEADER_SIZE);
@@ -799,17 +782,18 @@ static void send_info(uint16_t req_seq, const ip_addr_t *dest, uint16_t port)
 }
 
 /* ---- Sender validation (zero-day defense) ----
- * When the device is STREAMING, only the CURRENT streaming server (the one
- * that sent CONFIGURE) should be able to:
- *   - STOP the stream (handle_stop)
- *   - Reset the watchdog via DISCOVER heartbeat (handle_discover)
- *   - Redirect the stream via re-CONFIGURE (handle_configure)
- * Without this check, any host on the same network can send CMD_STOP or
- * spoof DISCOVER heartbeats to keep a dead stream alive, or redirect the
- * audio to themselves. This is a security hardening, not a protocol
- * requirement — the EASSP protocol has no authentication.
- * When IDLE (not streaming), any sender is accepted (discovery + first
- * CONFIGURE must work from any server). */
+ * When STREAMING, only the current streaming server may STOP / reset
+ * watchdog / re-CONFIGURE.
+ *
+ * SECURITY CAVEAT — EASSP has NO real authentication (Fix F-A #10):
+ *   - Source IP is spoofable on most LANs (no ARP binding to MAC).
+ *   - No MAC verification, no nonce/replay protection, no HMAC/signature.
+ *   - sender_is_current_server() only does an IP-equality check against
+ *     s_server_svc_addr.
+ * This is a BEST-EFFORT check, useful as hardening on a TRUSTED LAN
+ * only — do NOT rely on it as a security boundary on a hostile network
+ * or across the open internet. When NOT streaming, ANY sender is
+ * accepted (so initial discovery/configure works). */
 static bool sender_is_current_server(const ip_addr_t *src_addr)
 {
     /* If not streaming, accept any sender (initial discovery/configure). */
@@ -847,33 +831,51 @@ static void handle_discover(const svc_header_t *hdr,
     s_last_discover_ticks = now_ticks();
     s_server_svc_addr = *src_addr;
     s_server_svc_port = src_port;
-    bool streaming = (s_state == SVC_STREAMING);
     xSemaphoreGive(s_mutex);
 
-    if (streaming)
-    {
-        /* Heartbeat - no response, just reset watchdog.
-         *
-         * FIX (AUDIT-XPORT-AUTOAPPLY): do NOT send INFO when streaming.
-         * The INFO payload contains the current transport_mode. If the user
-         * did AT+XPORT=1 (saved to NVS but not applied), the INFO would
-         * report transport_mode=1 (TCP) even though the stream is still
-         * running on UDP. The server's (now-removed) AUTOTRANSPORT logic
-         * would see the change and auto-restart the stream, interrupting
-         * it. By not sending INFO during streaming, the server only learns
-         * about transport changes when the user explicitly stops and
-         * restarts the stream. */
-        return;
-    }
-
-    /* Idle: respond with INFO. */
+    /* FIX (FR-SVC #20): always send INFO response (both idle and streaming).
+     * During streaming this gives the server an immediate heartbeat ack
+     * instead of waiting for the next periodic INFO (~1s). */
     send_info(hdr->seq, src_addr, src_port);
+}
+
+/* FIX (F2-SVC #7): arm START_REQ atomically with the s_packets_sent
+ * reset. Previously the in-drain START_REQ set (when a CONFIGURE is
+ * received during the drain loop) did NOT reset s_packets_sent, racing
+ * with the new stream's update_stats calls — the new stream could
+ * briefly see a stale non-zero counter, or worse, the late post-drain
+ * reset could zero out the new stream's already-incremented counts.
+ * Routing ALL START_REQ sets in handle_configure through this helper
+ * guarantees the reset happens BEFORE the bit is set, so the new
+ * stream always starts at 0. The original FR-SVC #9 fix noted this
+ * in-drain race as out-of-scope; F2-SVC closes it. */
+static void arm_start_req(void)
+{
+    if (!s_stream_evt_grp)
+        return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_packets_sent = 0;
+    xSemaphoreGive(s_mutex);
+    xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_START_REQ);
 }
 
 static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
                              const ip_addr_t *src_addr, uint16_t src_port)
 {
+    bool start_already_armed = false;
+
     ESP_LOGI(TAG, "CONFIGURE from " IPSTR ":%u", IP2STR(src_addr), (unsigned)src_port);
+
+    /* FIX (F-A #1): reject CONFIGURE from any non-current-server sender.
+     * Safe for IDLE state because sender_is_current_server() returns true
+     * when not streaming (so initial discovery/configure still works).
+     * See the EASSP-auth SECURITY CAVEAT above sender_is_current_server(). */
+    if (!sender_is_current_server(src_addr))
+    {
+        ESP_LOGW(TAG, "CONFIGURE from non-server " IPSTR " - ignored (streaming)",
+                 IP2STR(src_addr));
+        return;
+    }
 
     const svc_configure_payload_t *cfg = (const svc_configure_payload_t *)payload;
 
@@ -882,6 +884,7 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
         ESP_LOGW(TAG, "CONFIGURE: invalid stream port");
         return;
     }
+    bool stream_active = streaming_is_active(); // FIX: учитываем окно ACTIVE→SVC_STREAMING
 
     /* CONFIGURE is just a "Start Stream" trigger.
      * The ESP is the audio authority - it streams exactly what is in its NVS
@@ -891,16 +894,13 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
 
     uint16_t new_port = ntohs(cfg->stream_port);
 
-    /* Check if already streaming to same destination. */
+    /* FIX (LOW): see FIXES.md */
     bool same;
+    bool need_stop;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* Only compare IP and port - channels are controlled entirely by NVS
-     * (via AT+CH), so we don't restart the stream if the server sends a
-     * CONFIGURE with a different channel count. */
-    same = (s_state == SVC_STREAMING) &&
+    same = (s_state == SVC_STREAMING || stream_active) &&
            s_server_ip.addr == src_addr->addr &&
            s_server_port == new_port;
-
     if (same)
     {
         s_last_discover_ticks = now_ticks();
@@ -923,96 +923,182 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
     s_server_svc_addr = *src_addr;
     s_server_svc_port = src_port;
     s_last_discover_ticks = now_ticks();
+    /* Snapshot need_stop (was s_state == SVC_STREAMING) in the SAME
+     * critical section — no need to release+reacquire the mutex. */
+    need_stop = (s_state == SVC_STREAMING || stream_active);
     xSemaphoreGive(s_mutex);
 
-    /* If currently streaming, request stop AND wait for completion. */
-    bool need_stop;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    need_stop = (s_state == SVC_STREAMING);
-    xSemaphoreGive(s_mutex);
+    /* FIX (MEDIUM #5, MEDIUM #6): see FIXES.md */
+    bool stop_requested = false;
 
     if (need_stop && s_stream_evt_grp)
     {
-        /* FIX (H3): previously this blocked the svc task for up to 2 s
-         * (SVC_RECONFIGURE_STOP_TIMEOUT_MS) waiting for s_stop_done_sem.
-         * During that wait the svc task loop body did not iterate ->
-         * recvfrom() didn't run -> DISCOVER heartbeats and any new
-         * CONFIGURE/STOP commands were dropped (lwIP socket buffer small),
-         * the periodic INFO sender didn't run, watchdog check didn't run,
-         * announce broadcasts didn't run.
-         *
-         * New approach: set STOP_REQ and poll s_stop_done_sem with a SHORT
-         * timeout (50 ms) in a loop, calling recvfrom() between polls so
-         * the service channel keeps working. Total wait still bounded by
-         * SVC_RECONFIGURE_STOP_TIMEOUT_MS. */
-        /* FIX (AUDIT-MEDIUM): clear s_stop_done_sem BEFORE setting STOP_REQ.
-         * The previous order (STOP_REQ then clear) had a lost-wakeup race:
-         * if the main loop processed STOP_REQ and called
-         * svc_port_notify_stop_complete (which gives the sem) between the
-         * two lines, the signal was consumed and lost, then handle_configure
-         * waited the full SVC_RECONFIGURE_STOP_TIMEOUT_MS for a signal that
-         * already fired - adding 2s of latency to every reconfigure. */
-        xSemaphoreTake(s_stop_done_sem, 0); /* clear stale signal */
+        /* FIX (H3): see FIXES.md — set STOP_REQ and poll streaming_is_active(). */
         xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_STOP_REQ);
 
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SVC_RECONFIGURE_STOP_TIMEOUT_MS);
         bool stopped = false;
         while (xTaskGetTickCount() < deadline)
         {
-            /* Service the recvfrom loop between polls: drain any pending
-             * commands so they aren't lost during the stop wait.
-             *
-             * FIX (AUDIT-H5): snapshot s_sock under the mutex before
-             * recvfrom, same pattern as in svc_task_fn. */
-            int drain_sock;
+            /* FIX (TOCTOU-1): recvfrom под мьютексом. MSG_DONTWAIT гарантирует
+             * неблокирующий возврат, поэтому мьютекс удерживается микросекунды.
+             * Это устраняет гонку с svc_port_reinit_socket_impl(), который
+             * закрывает/заменяет s_sock под тем же мьютексом.
+             * Паттерн идентичен send_to() (FIX F-A #5). */
+            uint8_t drain_buf[SVC_RECV_BUF_SIZE];
+            struct sockaddr_in drain_addr;
+            socklen_t drain_len = sizeof(drain_addr);
+            ssize_t rlen = -1;
+
             if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
             {
-                drain_sock = s_sock;
+                if (s_sock >= 0)
+                {
+                    rlen = recvfrom(s_sock, drain_buf, sizeof(drain_buf),
+                                    MSG_DONTWAIT,
+                                    (struct sockaddr *)&drain_addr, &drain_len);
+                }
                 xSemaphoreGive(s_mutex);
             }
             else
             {
-                drain_sock = s_sock; /* best-effort */
+                /* Мьютекс занят — пропускаем итерацию (не гонимся за stale fd). */
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
             }
-            uint8_t drain_buf[SVC_RECV_BUF_SIZE];
-            struct sockaddr_in drain_addr;
-            socklen_t drain_len = sizeof(drain_addr);
-            ssize_t rlen = recvfrom(drain_sock, drain_buf, sizeof(drain_buf),
-                                    MSG_DONTWAIT,
-                                    (struct sockaddr *)&drain_addr, &drain_len);
+
+            if (rlen < 0)
+            {
+                /* Нет данных или сокет невалиден — просто ждём. */
+                vTaskDelay(pdMS_TO_TICKS(50));
+                /* rlen == -1 → ниже идёт if (rlen > 0), который не сработает.
+                 * Переходим к проверке streaming_is_active(). */
+            }
             if (rlen > 0)
             {
-                /* Best-effort: process the drained command. We can't call
-                 * handle_configure/handle_stop recursively, but we can
-                 * update the watchdog timestamp for DISCOVER heartbeats.
-                 *
-                 * FIX (AUDIT-H7): write s_last_discover_ticks under the
-                 * mutex - svc_task_fn reads it under the mutex at line ~1002,
-                 * a torn 32-bit tick value (or stale interleaved read)
-                 * corrupts the watchdog calculation. */
-                if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+                /* FIX (AUDIT-H7, MEDIUM #36, MEDIUM #5, MEDIUM #6): see FIXES.md */
+                if (rlen >= (ssize_t)SVC_HEADER_SIZE)
                 {
-                    s_last_discover_ticks = now_ticks();
-                    xSemaphoreGive(s_mutex);
+                    svc_header_t dhdr;
+                    memcpy(&dhdr, drain_buf, SVC_HEADER_SIZE);
+                    if (dhdr.magic[0] == EASSP_MAGIC0 &&
+                        dhdr.magic[1] == EASSP_MAGIC1 &&
+                        dhdr.version == EASSP_VER)
+                    {
+                        if (dhdr.cmd == SVC_CMD_STOP)
+                        {
+                            /* FIX (F-A #2): verify sender — only honor
+                             * CMD_STOP from the current streaming server.
+                             * A spoofed CMD_STOP would otherwise kill the
+                             * stream mid-reconfigure. */
+                            ip_addr_t drain_ip = {.addr = drain_addr.sin_addr.s_addr};
+                            if (!sender_is_current_server(&drain_ip))
+                            {
+                                ESP_LOGW(TAG, "CMD_STOP during drain from non-server - ignored");
+                            }
+                            else
+                            {
+                                /* FIX (MEDIUM #5): see FIXES.md */
+                                stop_requested = true;
+                                ESP_LOGW(TAG, "CMD_STOP received during reconfigure "
+                                              "stop-wait — will honor (no restart)");
+                                if (s_stream_evt_grp)
+                                    xEventGroupSetBits(s_stream_evt_grp,
+                                                       STREAM_EVT_STOP_REQ);
+                            }
+                        }
+                        else if (dhdr.cmd == SVC_CMD_CONFIGURE)
+                        {
+                            /* FIX (F-A #2): verify sender — only honor
+                             * CONFIGURE during drain from the current
+                             * streaming server. A spoofed CONFIGURE could
+                             * otherwise redirect the stream to an attacker.
+                             * Sender rejected → no destination update AND
+                             * no START_REQ re-arm. */
+                            ip_addr_t drain_ip = {.addr = drain_addr.sin_addr.s_addr};
+                            if (!sender_is_current_server(&drain_ip))
+                            {
+                                ESP_LOGW(TAG, "CONFIGURE during drain from non-server - ignored");
+                            }
+                            else
+                            {
+                                /* FIX (MEDIUM #6): see FIXES.md */
+                                if (rlen >= (ssize_t)(SVC_HEADER_SIZE + 2))
+                                {
+                                    uint16_t new_drain_port;
+                                    memcpy(&new_drain_port,
+                                           drain_buf + SVC_HEADER_SIZE, 2);
+                                    new_drain_port = ntohs(new_drain_port);
+                                    if (new_drain_port != 0)
+                                    {
+                                        if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE)
+                                        {
+                                            s_server_ip.addr = drain_addr.sin_addr.s_addr;
+                                            s_server_port = new_drain_port;
+                                            s_server_svc_addr.addr = drain_addr.sin_addr.s_addr;
+                                            s_server_svc_port = ntohs(drain_addr.sin_port);
+                                            xSemaphoreGive(s_mutex);
+                                        }
+                                        ESP_LOGI(TAG, "CONFIGURE updated during drain: port=%u",
+                                                 (unsigned)new_drain_port);
+                                    }
+                                    else
+                                    {
+                                        ESP_LOGW(TAG, "CONFIGURE during drain: invalid stream_port=0 — ignoring");
+                                    }
+                                }
+                                else
+                                {
+                                    ESP_LOGW(TAG, "CONFIGURE during drain: payload truncated (rlen=%d) — keeping previous destination",
+                                             (int)rlen);
+                                }
+                                /* Re-arm START_REQ so the latest destination wins.
+                                 * FIX (Task 6-B): see FIXES.md — guard with
+                                 * stop_requested so an in-drain CMD_STOP wins.
+                                 * FIX (F2-SVC #7): use arm_start_req() so
+                                 * s_packets_sent is reset BEFORE the START_REQ
+                                 * bit is set — closes the in-drain START_REQ
+                                 * race noted as out-of-scope in the original
+                                 * FR-SVC #9 fix. */
+                                if (!stop_requested && !start_already_armed)
+                                {
+                                    arm_start_req();
+                                    start_already_armed = true;
+                                }
+                                else
+                                {
+                                    ESP_LOGI(TAG, "CONFIGURE during drain — "
+                                                  "stop requested, not "
+                                                  "re-arming START");
+                                }
+                            }
+                        }
+                        /* For any valid EASSP packet (incl. DISCOVER),
+                         * refresh the watchdog timestamp. */
+                        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+                        {
+                            s_last_discover_ticks = now_ticks();
+                            xSemaphoreGive(s_mutex);
+                        }
+                    }
                 }
                 else
                 {
-                    /* FIX (A4): skip the write if we can't take the mutex.
-                     * Previously this wrote s_last_discover_ticks WITHOUT the
-                     * mutex — a C11 data race with svc_task_fn's locked read.
-                     * On ESP8266 (single-core, 32-bit atomic writes) this is
-                     * benign in practice, but skipping the write keeps the
-                     * "all writes under mutex" invariant honest and silences
-                     * static analyzers. The worst case is a slightly stale
-                     * discover timestamp, which the watchdog tolerates. */
-                    /* (intentionally no write — see comment above) */
+                    /* Too short to be an EASSP header — just refresh the
+                     * watchdog timestamp best-effort. */
+                    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+                    {
+                        s_last_discover_ticks = now_ticks();
+                        xSemaphoreGive(s_mutex);
+                    }
                 }
             }
-            if (xSemaphoreTake(s_stop_done_sem, pdMS_TO_TICKS(50)) == pdTRUE)
+            if (!streaming_is_active())
             {
                 stopped = true;
                 break;
             }
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
         if (stopped)
             ESP_LOGI(TAG, "Previous stream stopped - starting new stream");
@@ -1021,13 +1107,6 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
                      SVC_RECONFIGURE_STOP_TIMEOUT_MS);
     }
 
-    /* Reset packet counter now that the old stream is stopped (its task
-     * will no longer call svc_port_update_stats). The new stream starts
-     * fresh from 0. */
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_packets_sent = 0;
-    xSemaphoreGive(s_mutex);
-
     /* Send INFO response. */
     send_info(hdr->seq, src_addr, src_port);
 
@@ -1035,14 +1114,24 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
     device_config_t dev_cfg;
     config_get_copy(&dev_cfg);
 
-    ESP_LOGI(TAG, "Requesting stream start: " IPSTR ":%u (%u Hz, %d ms, NVS ch=%u)",
+    ESP_LOGI(TAG, "Requesting stream start: " IPSTR ":%u (%u Hz, %u ms, NVS ch=%u)",
              IP2STR(src_addr), (unsigned)new_port,
-             (unsigned)dev_cfg.sample_rate, streaming_get_frame_ms(),
+             (unsigned)dev_cfg.sample_rate, (unsigned)streaming_get_frame_ms(),
              (unsigned)channel_format_to_count(dev_cfg.channel_format));
 
-    if (s_stream_evt_grp)
+    /* FIX (F2-SVC #7): arm START_REQ via the helper, which resets
+     * s_packets_sent to 0 BEFORE setting the bit. The previous standalone
+     * reset (FR-SVC #9) is now redundant — arm_start_req() does both.
+     * This also closes the in-drain START_REQ race (the in-drain path
+     * above now uses the same helper, so both START_REQ sets reset the
+     * counter atomically). */
+    if (!stop_requested && !start_already_armed)
     {
-        xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_START_REQ);
+        arm_start_req();
+    }
+    else
+    {
+        ESP_LOGI(TAG, "CMD_STOP received during reconfigure — not restarting");
     }
 }
 
@@ -1070,15 +1159,7 @@ static void handle_stop(const svc_header_t *hdr,
         xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_STOP_REQ);
     }
 
-    /* FIX (M11): do NOT set s_state = SVC_IDLE here. STREAM_EVT_STOP_REQ is
-     * just a request - the main loop processes it asynchronously and calls
-     * svc_port_notify_streaming_stopped() when the actual stop completes.
-     * Setting IDLE here immediately resumes announce broadcasts while the
-     * audio pipeline is still running - a second receiver seeing the
-     * announce may send CONFIGURE and kick off the legitimate stream. The
-     * INFO reply below will report the current state (SVC_STREAMING),
-     * which is honest ("I'm stopping, still streaming"). */
-    /* (state left as SVC_STREAMING; notify_streaming_stopped will set IDLE) */
+    /* FIX (M11): see FIXES.md */
 
     /* Send INFO response reflecting the current state. */
     send_info(hdr->seq, src_addr, src_port);
@@ -1089,10 +1170,6 @@ static void handle_stop(const svc_header_t *hdr,
 static void svc_task_fn(void *arg)
 {
     ESP_LOGI(TAG, "Service port task started");
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_state = SVC_IDLE;
-    xSemaphoreGive(s_mutex);
 
     uint8_t recv_buf[SVC_RECV_BUF_SIZE];
     TickType_t last_info = 0;
@@ -1110,16 +1187,15 @@ static void svc_task_fn(void *arg)
         if (st == SVC_STOPPED)
             break;
 
-        /* Receive (non-blocking-ish - short timeout for periodic tasks).
-         *
-         * FIX (AUDIT-H5): snapshot s_sock under the mutex before recvfrom.
-         * svc_port_reinit_socket() (called from the WiFi reconnect task)
-         * closes+replaces s_sock under the mutex. Without this snapshot,
-         * a WiFi reconnect during recvfrom would race on the closed fd
-         * (EBADF) or on a recycled fd number (reading from a different
-         * socket). Matches the pattern already used in send_to(). */
-        int sock_snapshot;
-        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+        /* FIX (F3-B #3): see FIXES.md — If s_sock is invalid (reinit failed),
+         * periodically retry reinit instead of spinning on EBADF forever.
+         * After 5 failed retries in svc_port_reinit_socket, s_sock stays -1
+         * and recvfrom would return EBADF every loop iteration. This check
+         * retries reinit every 5s and skips the recvfrom on invalid socket. */
+        static TickType_t last_reinit_attempt = 0;
+        /* Check s_sock under mutex (avoids false reinit when reinit just completed). */
+        int sock_snapshot = -1;
+        if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
         {
             sock_snapshot = s_sock;
             xSemaphoreGive(s_mutex);
@@ -1128,13 +1204,44 @@ static void svc_task_fn(void *arg)
         {
             sock_snapshot = s_sock; /* best-effort */
         }
+        if (sock_snapshot < 0)
+        {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_reinit_attempt) > pdMS_TO_TICKS(5000))
+            {
+                ESP_LOGW(TAG, "svc_task: s_sock invalid, retrying reinit");
+                last_reinit_attempt = now;
+                svc_port_reinit_socket();
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
-        /* FIX (L24): use sizeof(recv_buf) - the buffer is never used as a
-         * C string (no strncpy/strlen on it), so the -1 was unexplained
-         * and wasted 1 byte of RX capacity. */
-        ssize_t len = recvfrom(sock_snapshot, recv_buf, sizeof(recv_buf), 0,
-                               (struct sockaddr *)&src, &slen);
+        ssize_t len = -1;
+        int saved_errno = 0;
+
+        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+        {
+            sock_snapshot = s_sock;
+            if (sock_snapshot >= 0)
+            {
+                len = recvfrom(sock_snapshot, recv_buf, sizeof(recv_buf),
+                               MSG_DONTWAIT, (struct sockaddr *)&src, &slen);
+                saved_errno = errno;
+            }
+            xSemaphoreGive(s_mutex);
+        }
+        else
+        {
+            /* Mutex busy — skip this iteration entirely.
+             * Better than racing on a stale fd. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (len < 0)
+            errno = saved_errno; /* restore for any downstream checks */
 
         if (len >= SVC_HEADER_SIZE)
         {
@@ -1150,17 +1257,10 @@ static void svc_task_fn(void *arg)
                 const uint8_t *payload = recv_buf + SVC_HEADER_SIZE;
                 size_t avail = (size_t)len - SVC_HEADER_SIZE;
 
-                /* SECURITY (zero-day defense): validate payload_len.
-                 * payload_len is uint16 (max 65535) but our buffer is only
-                 * SVC_RECV_BUF_SIZE (256). The check `payload_len <= avail`
-                 * below already prevents reading past the buffer, but an
-                 * absurdly large payload_len (e.g. 60000) with a short
-                 * packet is a clear sign of a malformed/malicious packet.
-                 * Reject early with a clear log.
-                 *
-                 * FIX (AUDIT-MEDIUM): cast payload_len to size_t to avoid
-                 * sign-compare warning (uint16_t promotes to int, then is
-                 * compared with size_t). */
+                /* SECURITY: validate payload_len (uint16 max 65535, buffer
+                 * is SVC_RECV_BUF_SIZE). Reject malformed/malicious packets
+                 * early. FIX (AUDIT-MEDIUM): see FIXES.md — cast to size_t
+                 * to avoid sign-compare warning. */
                 if ((size_t)hdr.payload_len > sizeof(recv_buf) - SVC_HEADER_SIZE)
                 {
                     ESP_LOGW(TAG, "RX payload_len %u > buf capacity %u - rejected",
@@ -1174,8 +1274,7 @@ static void svc_task_fn(void *arg)
                     else if (hdr.cmd == SVC_CMD_CONFIGURE && hdr.payload_len >= CFG_PAYLOAD_SZ)
                         handle_configure(&hdr, payload, &ip, port);
                     else if (hdr.cmd == SVC_CMD_CONFIGURE)
-                        /* FIX (L23): explicit branch for truncated CONFIGURE
-                         * so the log says what's wrong, not "unknown". */
+                        /* FIX (L23): see FIXES.md */
                         ESP_LOGW(TAG, "RX CONFIGURE plen=%u too short (need %u)",
                                  (unsigned)hdr.payload_len, (unsigned)CFG_PAYLOAD_SZ);
                     else if (hdr.cmd == SVC_CMD_STOP)
@@ -1206,10 +1305,7 @@ static void svc_task_fn(void *arg)
         uint16_t svc_port = s_server_svc_port;
         uint32_t elapsed = (uint32_t)(now - s_last_discover_ticks) * portTICK_PERIOD_MS;
         ip_addr_t bcast = s_broadcast_addr;
-        /* FIX (GROK-19): snapshot any pending error flagged by the audio
-         * path (svc_port_set_error) and clear the pending flag. The actual
-         * UDP send_info() is then done from this svc_task context — no
-         * socket/mutex work on the i2s/TX hot path. */
+        /* FIX (GROK-19): see FIXES.md */
         uint8_t pending_err = s_error_pending;
         if (pending_err != SVC_ERR_NONE)
             s_error_pending = SVC_ERR_NONE;
@@ -1220,10 +1316,7 @@ static void svc_task_fn(void *arg)
          * waiting for the next periodic INFO interval. */
         if (pending_err != SVC_ERR_NONE && svc_addr.addr != 0)
         {
-            uint16_t s;
-            xSemaphoreTake(s_mutex, portMAX_DELAY);
-            s = s_seq_counter++;
-            xSemaphoreGive(s_mutex);
+            uint16_t s = next_info_seq();
             send_info(s, &svc_addr, svc_port);
             ESP_LOGI(TAG, "flushed pending error %u via INFO", (unsigned)pending_err);
         }
@@ -1235,16 +1328,26 @@ static void svc_task_fn(void *arg)
             {
                 last_info = now;
                 if (svc_addr.addr)
-                    { uint16_t s; xSemaphoreTake(s_mutex, portMAX_DELAY); s = s_seq_counter++; xSemaphoreGive(s_mutex); send_info(s, &svc_addr, svc_port); }
+                {
+                    uint16_t s = next_info_seq();
+                    send_info(s, &svc_addr, svc_port);
+                }
             }
             /* Watchdog. */
             if (elapsed >= SVC_WATCHDOG_TIMEOUT_MS)
             {
-                ESP_LOGW(TAG, "Watchdog expired (%u ms) - stopping", (unsigned)elapsed);
+                /* L8: log only once per watchdog fire (was flooding every 100ms
+                 * until stop_streaming completes, ~30 lines in ~3s). */
+                if (!s_watchdog_fired)
+                {
+                    ESP_LOGW(TAG, "Watchdog expired (%u ms) - stopping", (unsigned)elapsed);
+                    s_watchdog_fired = true;
+                }
                 if (s_stream_evt_grp)
                     xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_STOP_REQ);
+                /* FIX (MEDIUM #41): see FIXES.md */
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
-                s_state = SVC_IDLE;
+                /* Only the error code is set here; state stays SVC_STREAMING. */
                 s_error_code = SVC_ERR_WATCHDOG;
                 xSemaphoreGive(s_mutex);
             }
@@ -1259,20 +1362,10 @@ static void svc_task_fn(void *arg)
                 announce_ms = SVC_ANNOUNCE_MIN_MS + (esp_random() % (range + 1));
                 if (bcast.addr)
                 {
-                    /* FIX (M9): send to the ACTUAL bound port (s_port), not
-                     * the compile-time SVC_PORT_DEFAULT. If the service port
-                     * was changed at runtime (or via a non-default Kconfig),
-                     * receivers listening on the actual port would never
-                     * see the broadcast announce. */
-                    uint16_t s;
-                    xSemaphoreTake(s_mutex, portMAX_DELAY);
-                    s = s_seq_counter++;
-                    xSemaphoreGive(s_mutex);
+                    /* FIX (M9): see FIXES.md */
+                    uint16_t s = next_info_seq();
                     send_info(s, &bcast, s_port);
-                    /* FIX (DIAG-ANNOUNCE): log every Nth announce so we can
-                     * verify the announce path is alive after stop_streaming.
-                     * Without this, announce is silent and we can't tell if
-                     * ESP is sending or not. Log every 5th (~5-25 sec apart). */
+                    /* FIX (DIAG-ANNOUNCE): see FIXES.md */
                     static uint32_t announce_log_counter = 0;
                     if ((++announce_log_counter % 5) == 1)
                     {
@@ -1290,24 +1383,153 @@ static void svc_task_fn(void *arg)
 
     ESP_LOGI(TAG, "Service port task exiting");
 
-    /* FIX (GROK-1): clear our own task handle BEFORE vTaskDelete(NULL).
-     * Without this, svc_port_deinit's wait-loop never sees the handle go
-     * NULL, runs the full 3-second timeout, then calls vTaskDelete() on
-     * an already-freed TCB (use-after-free). Mirrors the pattern used in
-     * wifi_sta.c::wifi_reconnect_task (line 513). The mutex guards the
-     * handle against a concurrent deinit reading it. */
+    /* FIX (GROK-1): see FIXES.md — clear task handle BEFORE vTaskDelete. */
     if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
         s_task_handle = NULL;
         xSemaphoreGive(s_mutex);
-        if (s_stop_done_sem)
-            xSemaphoreGive(s_stop_done_sem);
     }
     else
     {
-        /* Mutex unavailable (e.g. orphaned) — still clear the handle
-         * unsynchronized; worst case is one stale poll by deinit. */
         s_task_handle = NULL;
     }
     vTaskDelete(NULL);
+}
+
+/* SINGLE-FLIGHT: internal implementation. All original logic unchanged.
+ * Called ONLY from svc_port_reinit_socket() under s_reinit_mutex. */
+static esp_err_t svc_port_reinit_socket_impl(void)
+{
+    bool is_stopped;
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+        is_stopped = (s_state == SVC_STOPPED);
+        xSemaphoreGive(s_mutex);
+    }
+    else
+    {
+        is_stopped = (s_state == SVC_STOPPED);
+    }
+    if (is_stopped)
+        return ESP_ERR_INVALID_STATE;
+
+    if (s_port == 0)
+        return ESP_ERR_INVALID_STATE;
+
+    ESP_LOGI(TAG, "Reinitializing UDP socket after WiFi reconnect (port %u)",
+             (unsigned)s_port);
+
+    int old_sock = -1;
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        old_sock = s_sock;
+        s_sock = -1;
+        xSemaphoreGive(s_mutex);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "reinit: mutex busy on close - aborting");
+        return ESP_FAIL;
+    }
+
+    if (old_sock >= 0)
+    {
+        shutdown(old_sock, SHUT_RDWR);
+        close(old_sock);
+    }
+
+    int new_sock = -1;
+    for (int i = 0; i < 5; i++)
+    {
+        new_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (new_sock >= 0)
+            break;
+        int saved_errno = errno;
+        ESP_LOGW(TAG, "reinit: socket() failed (errno=%d), retry %d/5",
+                 saved_errno, i + 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (new_sock < 0)
+    {
+        ESP_LOGE(TAG, "reinit: socket() failed after 5 retries - service degraded");
+        return ESP_FAIL;
+    }
+
+#ifdef CONFIG_LWIP_SO_REUSE
+    int enable = 1;
+    if (setsockopt(new_sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0)
+    {
+        int saved_errno = errno;
+        ESP_LOGW(TAG, "reinit: SO_REUSEADDR failed (errno=%d)", saved_errno);
+    }
+#endif
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(s_port);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    int bind_ok = -1;
+    for (int i = 0; i < 5; i++)
+    {
+        bind_ok = bind(new_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
+        if (bind_ok == 0)
+            break;
+        int saved_errno = errno;
+        ESP_LOGW(TAG, "reinit: bind() failed (errno=%d), retry %d/5",
+                 saved_errno, i + 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (bind_ok < 0)
+    {
+        ESP_LOGE(TAG, "reinit: bind() failed after 5 retries - service degraded");
+        close(new_sock);
+        return ESP_FAIL;
+    }
+
+#if CFG_UDP_RECEIVE_TIMEOUT_MS_ENABLED
+    struct timeval tv_rcv = {.tv_sec = UDP_RECEIVE_TIMEOUT_MS / 1000,
+                             .tv_usec = (UDP_RECEIVE_TIMEOUT_MS % 1000) * 1000};
+    if (setsockopt(new_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_rcv, sizeof(tv_rcv)) < 0)
+    {
+        int saved_errno = errno;
+        ESP_LOGW(TAG, "reinit: SO_RCVTIMEO failed (errno=%d)", saved_errno);
+    }
+#endif
+
+#if CFG_UDP_SEND_TIMEOUT_MS_ENABLED
+    struct timeval tv_snd = {.tv_sec = UDP_SEND_TIMEOUT_MS / 1000,
+                             .tv_usec = (UDP_SEND_TIMEOUT_MS % 1000) * 1000};
+    if (setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &tv_snd, sizeof(tv_snd)) < 0)
+    {
+        int saved_errno = errno;
+        ESP_LOGW(TAG, "reinit: SO_SNDTIMEO failed (errno=%d)", saved_errno);
+    }
+#endif
+
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        s_sock = new_sock;
+        s_no_route_logged = false;
+        xSemaphoreGive(s_mutex);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "reinit: mutex busy on swap - closing new socket");
+        close(new_sock);
+        return ESP_FAIL;
+    }
+
+    update_broadcast_addr();
+
+    if (old_sock == new_sock)
+    {
+        ESP_LOGI(TAG, "UDP socket reinitialized (fd %d, recycled by lwIP)", new_sock);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "UDP socket reinitialized (fd %d -> %d)", old_sock, new_sock);
+    }
+    return ESP_OK;
 }

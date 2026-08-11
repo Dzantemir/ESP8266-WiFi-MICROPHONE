@@ -14,6 +14,15 @@
  *   rawtx_stream.c  — Raw 802.11 TX via esp_wifi_80211_tx()
  */
 
+/* CONCURRENCY: s_active_ops and s_active_transport are set once in
+ * stream_mode_init() at boot. start_streaming() may call stream_mode_init()
+ * again on HOTRESTART (UDP<->TCP switch), but this happens in the main task
+ * context, and transport_*() wrappers are only called from the main task
+ * and pipeline tasks (which are stopped during HOTRESTART). On ESP8266
+ * (single-core, 32-bit aligned pointer writes are atomic), the lock-free
+ * read in transport_*() wrappers is safe in practice. For multi-core ports,
+ * add a mutex or use _Atomic. */
+
 /* ---- System / SDK includes ---- */
 #include "esp_log.h"
 
@@ -74,6 +83,9 @@ static esp_err_t udp_get_stream_dest(uint32_t *host, uint16_t *port)
 
 static void udp_set_channels(uint8_t channels)
 {
+    /* F3-A MEDIUM #5: no-op — svc_port_set_channels() is now a no-op;
+     * channels come from streaming_get_channels() in build_info_payload.
+     * Kept for API compat (vtable contract requires a set_channels slot). */
     svc_port_set_channels(channels);
 }
 
@@ -110,6 +122,13 @@ static void udp_close_client(void)
     udp_stream_deinit();
 }
 
+/* F2-TCP (#1.2): UDP sendto() is non-blocking (or bounded by UDP_SEND_TIMEOUT_MS
+ * when enabled, which is short). No abort hook needed. */
+static void udp_abort_send(void)
+{
+    /* no-op */
+}
+
 static const stream_mode_ops_t s_udp_ops = {
     .name = "UDP",
     .wifi_init = udp_wifi_init,
@@ -121,6 +140,7 @@ static const stream_mode_ops_t s_udp_ops = {
     .is_ready = udp_stream_is_ready,
     .send = udp_stream_send,
     .close_client = udp_close_client,
+    .abort_send = udp_abort_send,
     .deinit = udp_stream_deinit,
     .on_stream_started = udp_on_stream_started,
     .on_stream_stopped = udp_on_stream_stopped,
@@ -150,10 +170,8 @@ static esp_err_t rawtx_wifi_wait_ready(const device_config_t *cfg)
 
 static esp_err_t rawtx_get_stream_dest(uint32_t *host, uint16_t *port)
 {
-    /* Raw TX broadcasts to FF:FF:FF:FF:FF:FF - no destination to resolve.
-     * FIX (AUDIT-MEDIUM): zero the outputs so callers reading them see
-     * a defined value instead of stale stack. The contract is 'only valid
-     * for UDP/TCP mode' but returning OK with uninit outputs is fragile. */
+    /* Raw TX broadcasts to FF:FF:FF:FF:FF:FF — no destination to resolve.
+     * Zero the outputs so callers see a defined value (AUDIT-MEDIUM). */
     if (host) *host = 0;
     if (port) *port = 0;
     return ESP_OK;
@@ -196,6 +214,13 @@ static void rawtx_close_client(void)
     rawtx_stream_deinit();
 }
 
+/* F2-TCP (#1.2): RawTX send (esp_wifi_80211_tx) is non-blocking and has no
+ * peer to backpressure it. No abort hook needed. */
+static void rawtx_abort_send(void)
+{
+    /* no-op */
+}
+
 static const stream_mode_ops_t s_rawtx_ops = {
     .name = "Raw 802.11 TX",
     .wifi_init = rawtx_wifi_init,
@@ -207,6 +232,7 @@ static const stream_mode_ops_t s_rawtx_ops = {
     .is_ready = rawtx_stream_is_ready,
     .send = rawtx_stream_send,
     .close_client = rawtx_close_client,
+    .abort_send = rawtx_abort_send,
     .deinit = rawtx_stream_deinit,
     .on_stream_started = rawtx_on_stream_started,
     .on_stream_stopped = rawtx_on_stream_stopped,
@@ -275,6 +301,7 @@ static const stream_mode_ops_t s_tcp_ops = {
     .is_ready = tcp_stream_is_ready,
     .send = tcp_stream_send,
     .close_client = tcp_stream_close_client,
+    .abort_send = tcp_stream_abort,           /* F2-TCP (#1.2) */
     .deinit = tcp_stream_deinit,
     .on_stream_started = udp_on_stream_started,
     .on_stream_stopped = udp_on_stream_stopped,
@@ -288,9 +315,14 @@ static const stream_mode_ops_t s_tcp_ops = {
  * ==================================================================== */
 
 static const stream_mode_ops_t *s_active_ops = &s_udp_ops;
-/* FIX (split): remember the transport mode so main.c can pick the right
- * STREAM_STOP_TIMEOUT_*_MS (UDP vs TCP). RawTX has no send timeout but
- * uses the UDP value as a safe default. */
+/* Remember the transport mode so main.c can pick the right STREAM_STOP_TIMEOUT_*_MS
+ * (UDP vs TCP). RawTX uses UDP value as a safe default.
+ *
+ * Concurrency contract for s_active_ops / s_active_transport (read without a
+ * mutex in the transport_*() wrappers below): see the CONCURRENCY note at the
+ * top of this file. Short version: stream_mode_init() runs at boot AND on the
+ * HOTRESTART path (from main task, with pipeline tasks stopped); on ESP8266
+ * (single-core, atomic aligned-pointer writes) the lock-free read is safe. */
 static uint8_t s_active_transport = TRANSPORT_MODE_UDP;
 
 void stream_mode_init(const device_config_t *cfg)
@@ -299,16 +331,26 @@ void stream_mode_init(const device_config_t *cfg)
     {
     case TRANSPORT_MODE_TCP:
         s_active_ops = &s_tcp_ops;
+        s_active_transport = TRANSPORT_MODE_TCP;
         break;
     case TRANSPORT_MODE_RAWTX:
         s_active_ops = &s_rawtx_ops;
+        s_active_transport = TRANSPORT_MODE_RAWTX;
         break;
-    case TRANSPORT_MODE_UDP:
     default:
+        /* MEDIUM #25: normalize any non-TCP/non-RAWTX value (including
+         * TRANSPORT_MODE_UDP and any invalid enum) to UDP. Keeps
+         * s_active_ops and s_active_transport consistent so main.c picks
+         * the right STREAM_STOP_TIMEOUT_*_MS. Logs a warning only for
+         * genuinely invalid modes. */
         s_active_ops = &s_udp_ops;
+        s_active_transport = TRANSPORT_MODE_UDP;
+        if (cfg->transport_mode != TRANSPORT_MODE_UDP) {
+            ESP_LOGW(TAG, "invalid transport_mode %d, defaulting to UDP",
+                     (int)cfg->transport_mode);
+        }
         break;
     }
-    s_active_transport = cfg->transport_mode;
     ESP_LOGI(TAG, "Stream mode: %s", s_active_ops->name);
 }
 
@@ -321,6 +363,18 @@ uint8_t stream_mode_current_transport(void)
 {
     return s_active_transport;
 }
+
+const stream_mode_ops_t *stream_mode_ops_for(uint8_t transport_mode)
+{
+    switch (transport_mode)
+    {
+    case TRANSPORT_MODE_TCP:   return &s_tcp_ops;
+    case TRANSPORT_MODE_RAWTX: return &s_rawtx_ops;
+    default:                   return &s_udp_ops;
+    }
+}
+
+
 
 /* ---- Transport-agnostic wrappers (pure vtable dispatch, no if-branches) ---- */
 
@@ -342,4 +396,11 @@ esp_err_t transport_deinit(void)
 void transport_close_client(void)
 {
     s_active_ops->close_client();
+}
+
+/* F2-TCP (#1.2): abort any in-flight blocking send() so the TX task can
+ * self-exit within the stop timeout. No-op for UDP/RAWTX (see vtable docs). */
+void transport_abort_send(void)
+{
+    s_active_ops->abort_send();
 }

@@ -29,6 +29,7 @@
 #include "esp_attr.h" /* IRAM_ATTR, DRAM_ATTR */
 
 /* ---- Project includes ---- */
+#include "board_config.h" 
 #include "tpdf_dither.h"
 
 #ifdef TPDF_DEBUG
@@ -44,23 +45,17 @@
 #define TPDF_CHECK_SIGN_EXT16(v) ((void)0)
 #endif
 
-/* PRNG state. Intentionally NOT volatile: caching it in a register
- * across the entire dither loop is the whole point of the optimisation.
- * DO NOT mark this `volatile` "for thread safety" - it will force a
- * DRAM load+store on every sample and tank performance.
- * The function is single-task by contract; the I2S task is the only owner. */
-static DRAM_ATTR uint32_t tpdf_state = 0x12345678u;
+/* PRNG state. Intentionally NOT volatile: caching it in a register across
+ * the entire dither loop is the whole point of the optimisation. DO NOT mark
+ * `volatile` — it forces a DRAM load+store on every sample and tanks perf.
+ * Single-task by contract; the I2S task is the only owner.
+ * Initialized to 0; tpdf_init()/tpdf_seed() set a real seed before any call. */
+static DRAM_ATTR uint32_t tpdf_state = 0;
 
-/* Xorshift32 step. Pure function (value in, value out).
- *
- * Why value-in/value-out and not pointer-to-state:
- * - With `always_inline`, GCC produces identical code for both forms.
- * - The pure form is stylistically cleaner and documents the intent
- *   (no aliasing). It is also defensive: if a future edit removes
- *   `always_inline`, the value form keeps the state in a register
- *   while the pointer form might force a stack spill.
- * - The actual performance is the same; do not expect a measurable
- *   difference on -O2 with always_inline in place. */
+/* Xorshift32 step. Pure function (value in, value out). With `always_inline`
+ * GCC produces identical code to a pointer-based form; the pure form is
+ * stylistically cleaner and defensive against future removal of
+ * `always_inline` (keeps state in a register vs. potential stack spill). */
 static inline IRAM_ATTR __attribute__((always_inline, optimize("O2")))
 uint32_t
 xorshift32_step(uint32_t x)
@@ -112,8 +107,11 @@ IRAM_ATTR __attribute__((optimize("O2"))) void dither_buffer_24_to_16(const int3
 
         int32_t dithered = sample + (int32_t)r1 - (int32_t)r2;
 
-        /* Arithmetic right shift = `srai` on LX106, sign-preserving.
-         * Valid ONLY because input is sign-extended - see header. */
+        /* LOW: arithmetic right-shift of a signed int32_t is
+         * implementation-defined per C99/C11 (not UB), but GCC/Xtensa uses
+         * `srai` (sign-preserving) on LX106. Safe on ESP8266; on a non-
+         * sign-preserving port this would need an explicit shift. Valid ONLY
+         * because input is sign-extended — see header. */
         int32_t result = dithered >> 8;
 
         /* Clamp to int16. Dither can push the result ~1 LSB beyond

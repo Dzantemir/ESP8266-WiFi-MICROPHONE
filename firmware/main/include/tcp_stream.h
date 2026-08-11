@@ -8,55 +8,61 @@
 /*
  * TCP transport for audio streaming.
  *
- * ESP = listener (TCP server). После CONFIGURE открывает listening socket
- * на stream_port и ждёт connect от приёмника. Один активный коннект за раз.
+ * ESP = listener (TCP server). After CONFIGURE, opens a listening socket on
+ * stream_port and waits for the receiver to connect. One active connection
+ * at a time.
  *
- * Framing (TCP = поток без границ, нужны разделители):
- *   Каждый кадр = [u16 length BE][16-byte pkt_header][payload]
- *   length = 16 + payload_len (≤ 1416, влезает в u16).
- *   Приёмник: read(2) → length → read(length) → парсинг как UDP-пакет.
+ * Framing (TCP has no message boundaries):
+ *   Each frame = [u16 length BE][16-byte pkt_header][payload]
+ *   length = 16 + payload_len (<= 1400, fits u16).
+ *   Receiver: read(2) length -> read(length) -> parse as UDP-like packet.
  *
  * Backpressure:
- *   send() — BLOCKING с SO_SNDTIMEO=2сек. Если приёмник медленный, send
- *   блокируется → ADPCM-очередь заполняется → I2S дропает кадры
- *   (естественный backpressure, как в UDP). Это avoids deadlock, который
- *   возникал с non-blocking send + select() (ESP ждёт writable, сервер
- *   ждёт данные — никто не двигается).
+ *   send() is BLOCKING with SO_SNDTIMEO=2s. If the receiver is slow, send
+ *   blocks -> ADPCM queue fills -> I2S drops frames (natural backpressure,
+ *   as in UDP). Avoids the deadlock that non-blocking send + select() caused.
  *
  * Lifecycle:
- *   tcp_stream_init_listen(port)   — открыть listener, ждать connect в фоне
- *   tcp_stream_is_ready()          — есть активный клиентский коннект
- *   tcp_stream_send(data, len)     — отправить кадр (с framing, blocking)
- *   tcp_stream_close_client()      — закрыть ТОЛЬКО клиент (listener живёт)
- *   tcp_stream_deinit()            — закрыть всё (listener + client + task)
+ *   tcp_stream_init_listen(port)   — open listener, accept in background
+ *   tcp_stream_is_ready()          — true if an active client is connected
+ *   tcp_stream_send(data, len)     — send a frame (framing + blocking)
+ *   tcp_stream_close_client()      — close ONLY the client (listener stays)
+ *   tcp_stream_deinit()            — close everything (listener + client + task)
  */
 
-/* Открыть listening socket на port и начать принимать коннекты в фоновой
- * задаче. При новом connect старый коннект закрывается (1 клиент за раз).
- * port = порт из CONFIGURE (семантически переиспользуем, как UDP). */
+/* Open a listening socket on `port` and start accepting connections in a
+ * background task. On a new connect, the old connection is closed (1 client
+ * at a time). `port` comes from CONFIGURE (semantically reused, like UDP). */
 esp_err_t tcp_stream_init_listen(uint16_t port);
 
-/* Закрыть listener + активный коннект + остановить accept-задачу. */
+/* Close listener + active connection + stop the accept task. */
 esp_err_t tcp_stream_deinit(void);
 
-/* FIX (WiFi reconnect): пересоздать listening socket после WiFi
- * disconnect/reconnect. Старый socket становится "zombie" (привязан к
- * уничтоженному netif) и не принимает новые подключения. Без этого
- * сервер не может подключиться после WiFi drop до перезагрузки устройства.
- * No-op если TCP не инициализирован (s_listen_sock < 0). */
+/* FIX (WiFi reconnect): re-create the listening socket after WiFi
+ * disconnect/reconnect — the old one is a zombie bound to a destroyed netif.
+ * No-op if TCP is not initialized (s_listen_sock < 0). */
 esp_err_t tcp_stream_reinit_listener(void);
 
-/* Закрыть ТОЛЬКО активный клиентский коннект (не listener, не accept task).
- * Используется при stream stop — listening socket остаётся живым для
- * быстрого restart без EADDRINUSE. */
+/* Close ONLY the active client connection (keep listener + accept task).
+ * Used on stream stop so the listening socket stays alive for fast restart
+ * (no EADDRINUSE). */
 void tcp_stream_close_client(void);
 
-/* true, если есть активный клиентский коннект, готовый к send. */
+/* F2-TCP (#1.1): Abort any in-flight blocking send() by shutting down the
+ * active client socket. Called by teardown_pipeline() BEFORE waiting for the
+ * TX task to exit, so a send() blocked on SO_SNDTIMEO returns immediately
+ * and the TX task can self-exit within the stop timeout (instead of being
+ * force-deleted while holding s_client_mutex). No-op if no client is
+ * connected. Safe to call multiple times. */
+void tcp_stream_abort(void);
+
+/* true if there is an active client connection ready for send. */
 bool tcp_stream_is_ready(void);
 
-/* Отправить аудио-кадр. data = [pkt_header 16B][payload], len = 16+payload.
- * Добавляет 2-байт length-prefix (BE) и пишет в сокет (blocking, SO_SNDTIMEO=2с).
- * При таймауте/обрыве — закрывает клиентский сокет (accept task подберёт новый). */
+/* Send an audio frame. data = [pkt_header 16B][payload], len = 16+payload.
+ * Adds a 2-byte length prefix (BE) and writes to the socket (blocking,
+ * SO_SNDTIMEO=2s). On timeout/disconnect, closes the client socket (the
+ * accept task will pick up a new one). */
 esp_err_t tcp_stream_send(const uint8_t *data, size_t len);
 
 #endif /* TCP_STREAM_H */

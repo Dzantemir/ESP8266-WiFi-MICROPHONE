@@ -23,7 +23,8 @@
  *
  * AUDIO PARAMETERS:
  *   Sample rate: NVS-configurable via AT+RATE (default 16 kHz)
- *   Frame duration: computed at runtime from I2S params (typically 20 ms)
+ *   Frame duration: computed at runtime from I2S params
+ *     (typically 60 ms, largest that fits MTU + DMA min; see i2s_capture_compute_frame_ms)
  *   Channels: NVS-configurable via AT+CH (default mono)
  *   Codec: DVI4 IMA ADPCM (RFC 3551)
  *   Bitrate: sample_rate * 4 * channels bps
@@ -57,7 +58,6 @@
 #define SVC_ERR_CODEC       3
 #define SVC_ERR_NETWORK     4
 #define SVC_ERR_WATCHDOG    5
-#define SVC_ERR_CONFIG      6
 
 /* Payload sizes */
 #define INFO_PAYLOAD_SZ     58   /* v2.2: +24 bytes hostname (was 34) */
@@ -76,7 +76,12 @@ _Static_assert(sizeof(svc_header_t) == SVC_HEADER_SIZE, "svc_header_t must be 8 
 
 /* INFO payload (58 bytes, packed) - sent in response to DISCOVER/CONFIGURE.
  * v2.1: added transport_mode (1 byte).
- * v2.2: added hostname[24] at the end (max 23 chars + NUL, matches device_config_t). */
+ * v2.2: added hostname[24] at the end (max 23 chars + NUL, matches device_config_t).
+ *
+ * v2.0 baseline (33 bytes) includes: status, codec_id, error, channels,
+ * sample_rate, frame_ms, mac[6], packets_sent, free_heap, wifi_rssi,
+ * firmware[8], bits_per_sample. transport_mode added in v2.1 (+1 byte).
+ * hostname[24] added in v2.2 (+24 bytes). */
 typedef struct __attribute__((packed)) svc_info_payload {
     uint8_t  status;        /* SVC_STATUS_* */
     uint8_t  codec_id;      /* CODEC_ID_ADPCM = 5, CODEC_ID_PCM = 6 */
@@ -88,12 +93,7 @@ typedef struct __attribute__((packed)) svc_info_payload {
     uint32_t packets_sent;  /* since stream start */
     uint32_t free_heap;     /* current free heap */
     int8_t   wifi_rssi;     /* dBm */
-    /* NOTE (AUDIT-LOW): firmware[8] only holds 7 chars + NUL. FIRMWARE_VERSION
-     * is currently "v2.2" (fits), but bumping to e.g. "v10.5" or "v2.10"
-     * would silently truncate via strncpy. Bump INFO_PAYLOAD_SZ too if you
-     * enlarge this field (it's a wire-protocol change - old receivers will
-     * reject the larger INFO packet). */
-    char     firmware[8];   /* FIRMWARE_VERSION */
+    char     firmware[8];   /* FIRMWARE_VERSION (max 7 chars + NUL; see FIXES.md AUDIT-LOW) */
     uint8_t  bits_per_sample; /* 16 or 24 (from NVS config) */
     uint8_t  transport_mode;  /* v2.1: 0=UDP, 1=TCP, 2=Raw 802.11 TX */
     char     hostname[24];    /* v2.2: DHCP hostname (NUL-terminated, max 23 chars) */

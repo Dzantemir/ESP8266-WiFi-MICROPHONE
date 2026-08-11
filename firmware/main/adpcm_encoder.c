@@ -13,13 +13,7 @@
 
 /* ---- System / SDK includes ---- */
 #include <stdlib.h>
-/* FIX (GROK-G11-21): explicit <stdint.h> for int16_t/uint8_t/int32_t used
- * below (step_table, index_table, encode_sample, etc.). Previously these
- * types were pulled in transitively via adpcm_encoder.h -> esp_err.h ->
- * stdint.h, which is fragile — refactoring the header could break the .c
- * file with cryptic "unknown type name 'int16_t'" errors. Best practice:
- * a .c file includes what it uses. */
-#include <stdint.h>
+#include <stdint.h>   /* GROK-G11-21: explicit, for int16_t/uint8_t/int32_t */
 #include "esp_attr.h"
 #include "esp_log.h"
 
@@ -154,6 +148,9 @@ IRAM_ATTR __attribute__((optimize("O2"))) esp_err_t adpcm_enc_process(adpcm_enc_
                                                                       const int16_t *pcm, int num_samples,
                                                                       uint8_t *out, size_t out_size, size_t *written)
 {
+    /* LOW: IRAM_ATTR on the whole function wastes ~50-100 bytes for cold-path
+     * arg/size checks. Could be split into a non-IRAM wrapper + IRAM inner,
+     * but the savings are small and the split adds complexity. */
     if (!enc || !pcm || !out || !written)
     {
         return ESP_ERR_INVALID_ARG;
@@ -172,8 +169,9 @@ IRAM_ATTR __attribute__((optimize("O2"))) esp_err_t adpcm_enc_process(adpcm_enc_
     }
 
     /* Write DVI4 header (predictor + index + reserved).
-     * Predictor is written in CPU native byte order (little-endian on Xtensa).
-     * The PB server reads it with CVI() which is also little-endian. */
+     * LOW: byte order is EXPLICIT little-endian (matches the DVI4 wire format
+     * documented in adpcm_encoder.h; PB server reads with CVI() = LE). Not
+     * "CPU native" — the wire format is stable regardless of CPU. */
     out[0] = (uint8_t)(enc->predictor & 0xFF);
     out[1] = (uint8_t)((enc->predictor >> 8) & 0xFF);
     out[2] = (uint8_t)enc->step_index;

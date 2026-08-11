@@ -35,12 +35,6 @@
 /* Initialize the service port. Must be called after WiFi is connected. */
 esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp);
 
-/* FIX (H7): tear down the service port - close socket, delete task, free
- * sync primitives. Used when switching to a transport that doesn't use
- * svc_port (e.g. RAWTX). Without this, switching UDP/TCP -> RAWTX leaks
- * the svc_port task + UDP listener + ~5KB heap for the device lifetime. */
-void svc_port_deinit(void);
-
 /* Check if the service port task is running. */
 bool svc_port_is_running(void);
 
@@ -73,12 +67,7 @@ void svc_port_update_stats(uint32_t packets_sent);
  * Returns true if a valid CONFIGURE has been received. */
 bool svc_port_get_stream_dest(uint32_t *host, uint16_t *port);
 
-/* FIX (H1): Get the service-channel IP of the currently configured server
- * (the source IP of the most recent CONFIGURE). Used by tcp_stream.c's
- * accept task to refuse unauthorized TCP clients — any LAN host could
- * otherwise connect to the TCP audio port and hijack the stream.
- * Returns true if a server is configured; *ip is set to the network-order
- * IPv4 address. */
+/* FIX (H1): see FIXES.md */
 bool svc_port_get_server_ip(uint32_t *ip);
 
 /* Set the channel count reported in INFO packets.
@@ -86,22 +75,31 @@ bool svc_port_get_server_ip(uint32_t *ip);
  * count from NVS config. */
 void svc_port_set_channels(uint8_t channels);
 
-/* FIX (B3/channels-desync): get the CONFIG channel count (what will be
- * applied on the next stream start). Updated immediately by AT+CH.
- * Use this for INFO/STATUS when no stream is active (IDLE) so the receiver
- * sees the pending channel count, not a stale value from the last stream.
- * When a stream IS active, use streaming_get_channels() instead — it
- * returns the channel count the running stream is actually using. */
-uint8_t svc_port_get_channels(void);
-
 /* Refresh broadcast address after IP change. */
 void svc_port_update_broadcast(void);
 
 /* Set error code. The next INFO packet will carry this error. */
 void svc_port_set_error(uint8_t error_code);
 
+/* FIX (F2-SVC #8): set error_code ONLY if no error is currently set.
+ * Use this from callers that detect a transient/lower-priority error
+ * (e.g. SVC_ERR_NETWORK from a single failed sendto) so they don't
+ * clobber a higher-priority error (I2S, CODEC, MEMORY) already set by
+ * an upstream task. The unconditional svc_port_set_error() above is
+ * kept for callers that explicitly want to overwrite (e.g. the watchdog
+ * path setting SVC_ERR_WATCHDOG). */
+void svc_port_set_error_if_none(uint8_t error_code);
+
 /* Clear error code. */
 void svc_port_clear_error(void);
+
+/* FIX (FR-SVC #7): clear error code ONLY if the currently-active error
+ * matches `error_code`. Use this from callers that recover from a specific
+ * error (e.g. SVC_ERR_NETWORK after a successful TX) to avoid clobbering an
+ * unrelated upstream error (e.g. SVC_ERR_I2S). The unconditional
+ * svc_port_clear_error() above is kept for cases where a full clear is
+ * intentional (e.g. on streaming start). */
+void svc_port_clear_error_code(uint8_t error_code);
 
 /* Status snapshot for AT+STATUS command. */
 typedef struct {

@@ -46,10 +46,6 @@
  *   force a DRAM access on every sample and destroy the optimisation.
  */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* Initialise PRNG with a fixed, reproducible seed. Call once at startup.
  * For non-deterministic startup, call tpdf_seed(esp_random()) instead. */
 void tpdf_init(void);
@@ -66,9 +62,5 @@ void dither_buffer_24_to_16(const int32_t *in, int16_t *out, int n);
 /* 16-bit sign-extended in int32_t -> int16_t passthrough.
  * No bit-depth reduction - clamp + narrowing copy only. */
 void dither_buffer_passthrough(const int32_t *in, int16_t *out, int n);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* TPDF_DITHER_H */
