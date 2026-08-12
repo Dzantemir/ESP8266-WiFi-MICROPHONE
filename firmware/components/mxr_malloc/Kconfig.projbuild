@@ -258,8 +258,9 @@ menu "MxR-Malloc"
         default y
         help
             If enabled, pure 32-bit allocations such as malloc(),
-            _malloc_r(), heap_caps_malloc(size, MALLOC_CAP_32BIT)
-            and heap_caps_malloc(size, 0) may be placed into the
+            _malloc_r(), heap_caps_malloc(size, MALLOC_CAP_32BIT),
+            heap_caps_malloc(size, MALLOC_CAP_INTERNAL) and
+            heap_caps_malloc(size, 0) may be placed into the
             IRAM fallback zone.
 
             If disabled, MALLOC_CAP_EXEC allocations still use the
@@ -285,6 +286,47 @@ menu "MxR-Malloc"
 
             EXEC allocations are not limited by this option.
 
+    config MXR_IRAM_EXEC_WHOLE_IF_NO_FB
+        bool "Give whole IRAM to EXEC zone when fallback is disabled"
+        depends on MXR_USE_IRAM && !MXR_IRAM_FALLBACK_ENABLED
+        default y
+        help
+            When 32BIT fallback is disabled, the IRAM area beyond
+            CONFIG_MXR_IRAM_RESERVE_BYTES would otherwise be unusable
+            but still counted in heap statistics (overreported free
+            memory).
+            If enabled (recommended), the EXEC zone is expanded to
+            cover the whole IRAM arena, so MALLOC_CAP_EXEC allocations
+            can use all IRAM.
+            If disabled, the EXEC zone stays [0, reserve) and the rest
+            of IRAM is excluded from the arena and from all statistics.
+
+    choice
+        prompt "IRAM fallback allocation order"
+        depends on MXR_USE_IRAM && MXR_IRAM_FALLBACK_ENABLED
+        default MXR_IRAM_FB_ORDER_DRAM_FIRST
+        help
+            IRAM first:
+                Pure 32-bit allocations try the IRAM fallback zone
+                BEFORE DRAM (original MxR behavior).
+            DRAM first (recommended):
+                Pure 32-bit allocations try DRAM first and only use
+                the IRAM fallback zone when DRAM allocation fails.
+                This keeps arbitrary byte-accessed data out of IRAM
+                as long as DRAM has room.
+
+    config MXR_IRAM_FB_ORDER_IRAM_FIRST
+        bool "IRAM first (original MxR behavior)"
+        help
+            32-bit allocations prefer the IRAM fallback zone.
+
+    config MXR_IRAM_FB_ORDER_DRAM_FIRST
+        bool "DRAM first, IRAM as true fallback (recommended)"
+        help
+            32-bit allocations use IRAM only after DRAM fails.
+
+    endchoice
+    
     # ============================================================
     #  IRAM fallback region configuration
     # ============================================================

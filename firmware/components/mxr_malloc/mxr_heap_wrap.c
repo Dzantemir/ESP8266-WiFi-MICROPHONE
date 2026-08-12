@@ -24,43 +24,48 @@
 /* ================================================================
  *  Base wraps
  * ================================================================ */
-void  __wrap_heap_caps_init(void)
+void __wrap_heap_caps_init(void)
 {
     mxr_init();
 }
 
-void *  MXR_WRAP_IRAM __wrap__heap_caps_malloc(
+void *MXR_WRAP_IRAM __wrap__heap_caps_malloc(
     size_t size, uint32_t caps, const char *file, size_t line)
 {
-    (void)file; (void)line;
+    (void)file;
+    (void)line;
     return mxr_malloc_caps(size, caps);
 }
 
-void  MXR_WRAP_IRAM __wrap__heap_caps_free(
+void MXR_WRAP_IRAM __wrap__heap_caps_free(
     void *ptr, const char *file, size_t line)
 {
-    (void)file; (void)line;
+    (void)file;
+    (void)line;
     mxr_free(ptr);
 }
 
 void *MXR_WRAP_ALLOC_ATTR __wrap__heap_caps_realloc(
     void *mem, size_t newsize, uint32_t caps, const char *file, size_t line)
 {
-    (void)file; (void)line;
+    (void)file;
+    (void)line;
     return mxr_realloc_caps(mem, newsize, caps);
 }
 
 void *MXR_WRAP_ALLOC_ATTR __wrap__heap_caps_calloc(
     size_t count, size_t size, uint32_t caps, const char *file, size_t line)
 {
-    (void)file; (void)line;
+    (void)file;
+    (void)line;
     return mxr_calloc_caps(count, size, caps);
 }
 
 void *MXR_WRAP_ALLOC_ATTR __wrap__heap_caps_zalloc(
     size_t size, uint32_t caps, const char *file, size_t line)
 {
-    (void)file; (void)line;
+    (void)file;
+    (void)line;
     return mxr_zalloc_caps(size, caps);
 }
 
@@ -82,6 +87,21 @@ size_t __wrap_heap_caps_get_dram_free_size(void)
 {
     return mxr_get_free_size_caps(
         MALLOC_CAP_8BIT | MALLOC_CAP_32BIT | MALLOC_CAP_DMA);
+}
+/* FIX(2.3) */
+size_t __wrap_heap_caps_get_total_size(uint32_t caps)
+{
+    return mxr_get_total_size_caps(caps);
+}
+
+size_t __wrap_heap_caps_get_allocated_size(uint32_t caps)
+{
+    return mxr_get_allocated_size_caps(caps);
+}
+
+size_t __wrap_heap_caps_get_largest_free_block(uint32_t caps)
+{
+    return mxr_get_largest_free_block_caps(caps);
 }
 #endif /* CONFIG_MXR_WRAP_HEAP_QUERY */
 

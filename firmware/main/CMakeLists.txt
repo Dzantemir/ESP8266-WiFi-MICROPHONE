@@ -3,3 +3,7 @@ idf_component_register(
     INCLUDE_DIRS include
 )
 
+# Кастомный include/driver/i2s.h ДОЛЖЕН быть раньше SDK-овского
+target_include_directories(${COMPONENT_LIB} BEFORE PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../components/i2s_custom/include")
+
