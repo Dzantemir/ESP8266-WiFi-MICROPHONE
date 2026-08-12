@@ -989,8 +989,7 @@ ESP8266-WiFi-MICROPHONE/
 |   |   └── i2s_custom/
 |   |       ├── CMakeLists.txt
 |   |       ├── i2s.c
-|   |       └── include/driver/
-|   |           └── i2s.h
+|   |       └── include/driver/i2s.h
 |   |
 │   └── main/
 │       ├── CMakeLists.txt
