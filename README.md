@@ -1202,7 +1202,7 @@ guards. Defaults work out of the box.
 
 - **Espressif** — ESP8266 RTOS SDK
 - **PowerBASIC** — Windows application development
-- **Z.ai Code & Qwen3.8-Max** — AI-assisted development
+- **Z.ai & Qwen** — AI-assisted development
 - **INMP441** — High-quality I2S MEMS microphone
 - **Grok (xAI)** — Collaborative debugging of sleep/wake, click, and limiter issues
 - **Yeh et al. (2013)** — BWSOLA packet-loss concealment algorithm
