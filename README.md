@@ -975,7 +975,6 @@ ESP8266-WiFi-MICROPHONE/
 │
 ├── firmware/                      # ESP8266 firmware (ESP8266 RTOS SDK v3.4)
 │   ├── CMakeLists.txt             # Project definition
-│   ├── i2s.c                      # Patched I2S driver (REPLACE in SDK)
 │   │
 │   ├── components/
 │   │   └── mxr_malloc/            # MxR-malloc custom heap allocator
