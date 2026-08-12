@@ -977,15 +977,21 @@ ESP8266-WiFi-MICROPHONE/
 │   ├── CMakeLists.txt             # Project definition
 │   │
 │   ├── components/
-│   │   └── mxr_malloc/            # MxR-malloc custom heap allocator
-│   │       ├── CMakeLists.txt     # Region validation + wrap flags
-│   │       ├── Kconfig.projbuild  # MxR-Malloc menu
-│   │       ├── mxr_malloc.c       # Core allocator
-│   │       ├── mxr_heap_wrap.c    # Wrap-mode hooks (--wrap=heap_caps_*)
-│   │       ├── mxr_heap_compat.c  # ESP heap compat layer
-│   │       ├── mxr_heap_port.c    # Port-mode (direct malloc/free)
-│   │       └── include/mxr_malloc.h
-│   │
+│   │   ├── mxr_malloc/            # MxR-malloc custom heap allocator
+│   │   |   ├── CMakeLists.txt     # Region validation + wrap flags
+│   │   |   ├── Kconfig.projbuild  # MxR-Malloc menu
+│   │   |   ├── mxr_malloc.c       # Core allocator
+│   │   |   ├── mxr_heap_wrap.c    # Wrap-mode hooks (--wrap=heap_caps_*)
+│   │   |   ├── mxr_heap_compat.c  # ESP heap compat layer
+│   │   |   ├── mxr_heap_port.c    # Port-mode (direct malloc/free)
+│   │   |   └── include/mxr_malloc.h
+│   │   |
+|   |   └── i2s_custom/
+|   |       ├── CMakeLists.txt
+|   |       ├── i2s.c
+|   |       └── include/driver/
+|   |           └── i2s.h
+|   |
 │   └── main/
 │       ├── CMakeLists.txt
 │       ├── Kconfig.projbuild      # menuconfig options
