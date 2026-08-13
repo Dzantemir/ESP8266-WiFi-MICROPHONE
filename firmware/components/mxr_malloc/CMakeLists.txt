@@ -71,6 +71,14 @@ if(_MXR_CFG)
                 "MxR-malloc: DRAM region entry '${_entry}' has percent "
                 "${_PCT} > 100")
         endif()
+        # FIX: percent == 0 допустим только для последней записи
+        math(EXPR _NEXT_INDEX "${_MXR_INDEX} + 1")
+        if(_PCT EQUAL 0 AND _NEXT_INDEX LESS ${_MXR_DRAM_COUNT})
+        message(FATAL_ERROR
+        "MxR-malloc: DRAM region entry '${_entry}' (index ${_MXR_INDEX}) "
+        "has percent 0 but is not the last entry. "
+        "Only the last region may have percent 0.")
+        endif()
 
         # FIX(4.2): при COMPACT_TYPES граница не может быть > 65535
         if(CONFIG_MXR_COMPACT_TYPES AND _BOUNDARY GREATER 65535)
@@ -170,6 +178,14 @@ if(CONFIG_MXR_USE_IRAM AND CONFIG_MXR_IRAM_FALLBACK_ENABLED)
                 message(FATAL_ERROR
                     "MxR-malloc: IRAM fallback region entry '${_entry}' "
                     "has percent ${_PCT} > 100")
+            endif()
+            # FIX: percent == 0 допустим только для последней записи
+            math(EXPR _NEXT_INDEX "${_MXR_INDEX} + 1")
+            if(_PCT EQUAL 0 AND _NEXT_INDEX LESS ${_MXR_IRAM_COUNT})
+            message(FATAL_ERROR
+            "MxR-malloc: IRAM fallback region entry '${_entry}' "
+            "(index ${_MXR_INDEX}) has percent 0 but is not the last "
+            "entry. Only the last region may have percent 0.")
             endif()
 
             # FIX(4.2): ограничение COMPACT_TYPES

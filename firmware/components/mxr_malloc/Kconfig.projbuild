@@ -217,7 +217,7 @@ menu "MxR-Malloc"
 
     config MXR_USE_IRAM
         bool "Enable IRAM heap (EXEC + 32BIT fallback)"
-        default y if !CONFIG_HEAP_DISABLE_IRAM
+        default y if !HEAP_DISABLE_IRAM
         default n
         help
             Enables the IRAM heap arena.
