@@ -563,7 +563,7 @@ command.
 | `AT+XPORT=n` | Transport: 0=UDP, 1=TCP, 2=RawTX | `AT+XPORT=1` |
 | `AT+WCH=n` | WiFi channel 1–14 (RawTX only) | `AT+WCH=6` |
 | `AT+TIMING=sd,ws,bck` | I2S RX input delays (0–3 each) | `AT+TIMING=0,1,0` |
-| `AT+LOG=0|1` | Mute/restore ESP_LOG output | `AT+LOG=0` |
+| `AT+LOG=0-1` | Mute/restore ESP_LOG output | `AT+LOG=0` |
 | `AT+BATT?` | Battery voltage & charge (if enabled) | `AT+BATT?` |
 | `AT+HOTRESTART` | Restart stream (apply changes) | `AT+HOTRESTART` |
 | `AT+FACTORY` | Factory reset | `AT+FACTORY` |
