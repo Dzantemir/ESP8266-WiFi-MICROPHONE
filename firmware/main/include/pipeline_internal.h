@@ -68,10 +68,6 @@ extern uint8_t  s_channels;            /* 1 or 2, set at stream start     */
 extern uint32_t s_frame_ms;            /* frame duration in ms            */
 extern bool     s_frame_ms_known;      /* false until first successful start */
 
-/* Set by streaming_request_restart() (stream_control.c), cleared by
- * start_streaming() (pipeline.c) once the transport-change decision
- * has been applied or refused. */
-extern bool s_pending_transport_apply;
 
 /* Task bookkeeping — also used by supervisor.c for stack high-water checks. */
 extern TaskHandle_t      s_task_handles[TASK_IDX_COUNT];

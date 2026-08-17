@@ -476,8 +476,6 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg)
     /* On DMA descriptor error: report event and do NOT parse EOF descriptors. */
     if (int_st_snap.tx_dscr_err || int_st_snap.rx_dscr_err)
     {
-        ESP_EARLY_LOGE(I2S_TAG, "dma error, interrupt status: 0x%08x", int_st_snap.val);
-
         if (p_i2s->i2s_queue)
         {
             i2s_event.type = I2S_EVENT_DMA_ERROR;

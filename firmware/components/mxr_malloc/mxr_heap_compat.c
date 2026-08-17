@@ -83,12 +83,12 @@ size_t heap_caps_get_dram_free_size(void)
         MALLOC_CAP_8BIT | MALLOC_CAP_32BIT | MALLOC_CAP_DMA);
 }
 
-void *heap_caps_malloc_default(size_t size)
+void *MXR_COMPAT_ALLOC_ATTR heap_caps_malloc_default(size_t size)
 {
     return mxr_malloc_caps(size, MALLOC_CAP_32BIT);
 }
 
-void *heap_caps_realloc_default(void *ptr, size_t size)
+void *MXR_COMPAT_ALLOC_ATTR heap_caps_realloc_default(void *ptr, size_t size)
 {
     return mxr_realloc_caps(ptr, size, MALLOC_CAP_32BIT);
 }

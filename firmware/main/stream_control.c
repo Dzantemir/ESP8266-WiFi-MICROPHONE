@@ -89,8 +89,7 @@ bool streaming_request_restart(void)
      * HOTRESTART from overriding an intentional stop. */
     if (!streaming_is_active())
         return false;
-    /* FIX (AUDIT-XPORT-AUTOAPPLY): see FIXES.md */
-    s_pending_transport_apply = true;
+
     /* FIX (H5): see FIXES.md */
     xEventGroupSetBits(s_stream_evt_grp,
                        STREAM_EVT_STOP_REQ | STREAM_EVT_START_REQ);

@@ -109,7 +109,7 @@ size_t __wrap_heap_caps_get_largest_free_block(uint32_t caps)
  *  Default pool wraps
  * ================================================================ */
 #ifdef CONFIG_MXR_WRAP_DEFAULT_POOL
-void *__wrap_heap_caps_malloc_default(size_t size)
+void *MXR_WRAP_ALLOC_ATTR __wrap_heap_caps_malloc_default(size_t size)
 {
     return mxr_malloc_caps(size, MALLOC_CAP_32BIT);
 }

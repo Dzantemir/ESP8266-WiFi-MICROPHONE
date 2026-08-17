@@ -617,12 +617,16 @@ static void wifi_sta_set_credentials(wifi_config_t *cfg, const char *ssid,
     memcpy(cfg->sta.ssid, ssid, ssid_len);
     if (ssid_len < sizeof(cfg->sta.ssid))
         cfg->sta.ssid[ssid_len] = '\0';
-    size_t pwd_len = strlen(password);
-    if (pwd_len > sizeof(cfg->sta.password))
-        pwd_len = sizeof(cfg->sta.password);
-    memcpy(cfg->sta.password, password, pwd_len);
-    if (pwd_len < sizeof(cfg->sta.password))
-        cfg->sta.password[pwd_len] = '\0';
+    if (password && password[0])
+    {
+        size_t pwd_len = strlen(password);
+        if (pwd_len > sizeof(cfg->sta.password))
+            pwd_len = sizeof(cfg->sta.password);
+        memcpy(cfg->sta.password, password, pwd_len);
+        if (pwd_len < sizeof(cfg->sta.password))
+            cfg->sta.password[pwd_len] = '\0';
+    }
+    /* else: password stays {0} from wifi_config_t wifi_cfg = {0} → open AP */
 }
 
 /* Poll for reconnect task exit (100 ms granularity). */
@@ -645,10 +649,13 @@ esp_err_t wifi_sta_init(const char *ssid, const char *password,
     {
         wifi_sta_deinit();
     }
-    if (!ssid || !password)
+    /* Password may be NULL or empty for open networks. */
+    if (!ssid || !ssid[0])
     {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!password)
+        password = "";
     if (!hostname || !hostname[0])
     {
         hostname = WIFI_HOSTNAME_DEFAULT;
@@ -686,6 +693,11 @@ esp_err_t wifi_sta_init(const char *ssid, const char *password,
 
     wifi_config_t wifi_cfg = {0};
     wifi_sta_set_credentials(&wifi_cfg, ssid, password);
+    /* Explicitly set authmode for open networks. */
+    if (!password[0])
+    {
+        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
 
     /* HIGH #10: check return value of esp_wifi_set_config. */
     err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
@@ -1002,8 +1014,10 @@ void wifi_sta_set_tx_power(uint8_t tx_power)
 esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
 {
     /* LOW #22: distinguish "invalid argument" from "invalid state". */
-    if (!ssid || !password)
+    if (!ssid || !ssid[0])
         return ESP_ERR_INVALID_ARG;
+    if (!password)
+        password = "";
     if (!s_initialized)
         return ESP_ERR_INVALID_STATE;
 
@@ -1027,6 +1041,10 @@ esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
 
     wifi_config_t wifi_cfg = {0};
     wifi_sta_set_credentials(&wifi_cfg, ssid, password);
+    if (!password[0])
+    {
+        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
 
     esp_err_t err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
     if (err != ESP_OK)

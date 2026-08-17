@@ -123,8 +123,10 @@ if(_MXR_CFG)
             "must be <= 100%")
     endif()
 
+    math(EXPR _MXR_REMAINING "100 - ${_MXR_PCT_SUM}")
     message(STATUS
-        "MxR-malloc: DRAM region percent sum = ${_MXR_PCT_SUM}%")
+             "MxR-malloc: DRAM region percent sum = ${_MXR_PCT_SUM}%"
+             " (remaining ${_MXR_REMAINING}% goes to last region)")
     message(STATUS
         "MxR-malloc: ${_MXR_DRAM_COUNT} DRAM region(s) from "
         "'${CONFIG_MXR_REGION_CONFIG}'")
@@ -230,8 +232,10 @@ if(CONFIG_MXR_USE_IRAM AND CONFIG_MXR_IRAM_FALLBACK_ENABLED)
                 "must be <= 100%")
         endif()
 
+        math(EXPR _MXR_REMAINING "100 - ${_MXR_PCT_SUM}")
         message(STATUS
-            "MxR-malloc: IRAM region percent sum = ${_MXR_PCT_SUM}%")
+             "MxR-malloc: IRAM region percent sum = ${_MXR_PCT_SUM}%"
+             " (remaining ${_MXR_REMAINING}% goes to last region)")
         message(STATUS
             "MxR-malloc: ${_MXR_IRAM_COUNT} IRAM fallback region(s) from "
             "'${CONFIG_MXR_IRAM_FALLBACK_REGION_CONFIG}'")

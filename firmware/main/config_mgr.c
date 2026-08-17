@@ -64,7 +64,21 @@ static void set_defaults(device_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     strncpy(cfg->wifi_ssid, WIFI_SSID_DEFAULT, sizeof(cfg->wifi_ssid) - 1);
-    strncpy(cfg->wifi_password, WIFI_PASSWORD_DEFAULT, sizeof(cfg->wifi_password) - 1);
+    /* Validate Kconfig default password: empty is allowed (open network),
+     * non-empty must be 8-63 chars. If invalid, use empty (open). */
+    {
+        size_t plen = strlen(WIFI_PASSWORD_DEFAULT);
+        if (plen == 0 || (plen >= 8 && plen <= 63))
+        {
+            strncpy(cfg->wifi_password, WIFI_PASSWORD_DEFAULT, sizeof(cfg->wifi_password) - 1);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Kconfig password '%s' has invalid length %u - using open AP",
+                     WIFI_PASSWORD_DEFAULT, (unsigned)plen);
+            cfg->wifi_password[0] = '\0';
+        }
+    }
     strncpy(cfg->hostname, WIFI_HOSTNAME_DEFAULT, sizeof(cfg->hostname) - 1);
     cfg->tx_power = WIFI_TX_POWER_DEFAULT;
     cfg->svc_port = SVC_PORT_DEFAULT;
@@ -120,10 +134,20 @@ static esp_err_t load_from_nvs(device_config_t *cfg)
         strncpy(cfg->wifi_password, WIFI_PASSWORD_DEFAULT, sizeof(cfg->wifi_password) - 1);
         cfg->wifi_password[sizeof(cfg->wifi_password) - 1] = '\0';
     }
-    /* Warn (don't fail) on empty password (2-E LOW): open AP or NVS corruption. */
-    if (e == ESP_OK && !cfg->wifi_password[0])
+    /* Validate: empty is allowed (open network), non-empty must be 8-63. */
+    if (cfg->wifi_password[0])
     {
-        ESP_LOGW(TAG, "load_from_nvs: empty password loaded - open AP, or NVS corruption");
+        size_t plen = strlen(cfg->wifi_password);
+        if (plen < 8 || plen > 63)
+        {
+            ESP_LOGW(TAG, "load_from_nvs: password length %u invalid (8-63) - clearing",
+                     (unsigned)plen);
+            cfg->wifi_password[0] = '\0';
+        }
+    }
+    else
+    {
+        ESP_LOGI(TAG, "load_from_nvs: empty password - open AP mode");
     }
     len = sizeof(cfg->hostname);
     e = nvs_get_str(h, "host", cfg->hostname, &len);
@@ -535,6 +559,19 @@ esp_err_t config_mgr_init(void)
         s_config.i2s_timing_bck_delay = I2S_TIMING_BCK_DELAY_DEFAULT;
         corrected = true;
     }
+    /* Validate loaded WiFi password: empty is allowed (open network),
+     * non-empty must be 8-63 chars (WPA2 requirement). */
+    if (s_config.wifi_password[0])
+    {
+        size_t plen = strlen(s_config.wifi_password);
+        if (plen < 8 || plen > 63)
+        {
+            ESP_LOGW(TAG, "NVS password length %u invalid (must be 0 or 8-63) - clearing",
+                     (unsigned)plen);
+            s_config.wifi_password[0] = '\0';
+            corrected = true;
+        }
+    }
 
     if (corrected)
     {
@@ -596,9 +633,23 @@ static esp_err_t save_locked(void)
 
 esp_err_t config_set_wifi(const char *ssid, const char *password)
 {
-    if (!ssid || !password || !ssid[0] || !password[0])
+    if (!ssid || !ssid[0])
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* Password is optional: NULL or empty = open network.
+     * If present, WPA2 mandates 8-63 characters. */
+    if (!password)
+        password = "";
+    if (password[0])
+    {
+        size_t plen = strlen(password);
+        if (plen < 8 || plen > 63)
+        {
+            ESP_LOGW(TAG, "config_set_wifi: password length %u invalid (must be 8-63)",
+                     (unsigned)plen);
+            return ESP_ERR_INVALID_ARG;
+        }
     }
     /* Reject whitespace-only SSID (L30): 802.11 allows it but it's almost
      * certainly a user typo. */

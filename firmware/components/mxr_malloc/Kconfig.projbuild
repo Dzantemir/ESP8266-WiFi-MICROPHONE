@@ -153,6 +153,25 @@ menu "MxR-Malloc"
             Disable this only if you need size-class boundaries above
             64 KB or if you are adapting MxR-malloc to another target.
 
+    config MXR_DESC_BINARY_SEARCH
+        bool "Binary search for region-start descriptor (speed)"
+        default y
+        help
+            When searching for a free gap inside a size-class region,
+            first binary-search the descriptor array for the index of the
+            first block that can intersect the region, instead of always
+            scanning the whole array from index 0.
+
+            This reduces the per-allocation/per-free descriptor scan from
+            O(N) to O(log N + blocks-in-region). Most useful when many
+            descriptors are simultaneously active (e.g. > 100).
+
+            The defensive per-block "block_end <= region_start" check is
+            kept inside the loop, so correctness does not depend on the
+            binary search result.
+
+            Disable only for experiments or benchmarking comparisons.
+
     config MXR_IRAM_HOT_PATH_DISABLED
         bool "Disable placing malloc/free hot path in IRAM"
         default n

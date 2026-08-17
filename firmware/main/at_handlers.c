@@ -125,7 +125,8 @@ void cmd_at(void)
  * AT+NAME=val → ERROR by the dispatch (takes_args=false). */
 esp_err_t cmd_rst(uart_port_t uart, bool is_query, const char *args)
 {
-    (void)uart; (void)args;
+    (void)uart;
+    (void)args;
     if (is_query)
     {
         at_send_error();
@@ -137,7 +138,8 @@ esp_err_t cmd_rst(uart_port_t uart, bool is_query, const char *args)
 
 esp_err_t cmd_gmr(uart_port_t uart, bool is_query, const char *args)
 {
-    (void)uart; (void)args;
+    (void)uart;
+    (void)args;
     if (is_query)
     {
         at_send_error();
@@ -149,7 +151,8 @@ esp_err_t cmd_gmr(uart_port_t uart, bool is_query, const char *args)
 
 esp_err_t cmd_help(uart_port_t uart, bool is_query, const char *args)
 {
-    (void)uart; (void)args;
+    (void)uart;
+    (void)args;
     if (is_query)
     {
         at_send_error();
@@ -161,7 +164,8 @@ esp_err_t cmd_help(uart_port_t uart, bool is_query, const char *args)
 
 esp_err_t cmd_status(uart_port_t uart, bool is_query, const char *args)
 {
-    (void)uart; (void)args;
+    (void)uart;
+    (void)args;
     if (is_query)
     {
         at_send_error();
@@ -173,7 +177,8 @@ esp_err_t cmd_status(uart_port_t uart, bool is_query, const char *args)
 
 esp_err_t cmd_factory(uart_port_t uart, bool is_query, const char *args)
 {
-    (void)uart; (void)args;
+    (void)uart;
+    (void)args;
     if (is_query)
     {
         at_send_error();
@@ -185,7 +190,8 @@ esp_err_t cmd_factory(uart_port_t uart, bool is_query, const char *args)
 
 esp_err_t cmd_hotrestart(uart_port_t uart, bool is_query, const char *args)
 {
-    (void)uart; (void)args;
+    (void)uart;
+    (void)args;
     if (is_query)
     {
         at_send_error();
@@ -461,7 +467,9 @@ esp_err_t cmd_log(uart_port_t uart, bool is_query, const char *args)
  * AT+BATT=val is rejected by the dispatch (takes_args=false). */
 esp_err_t cmd_batt(uart_port_t uart, bool is_query, const char *args)
 {
-    (void)uart; (void)is_query; (void)args;
+    (void)uart;
+    (void)is_query;
+    (void)args;
     cmd_batt_query_impl();
     return ESP_OK;
 }
@@ -541,7 +549,7 @@ static void cmd_help_impl(void)
     at_send_str("+HELP:AT+WCH?        - show wifi channel (1-14)\r\n");
     at_send_str("+HELP:AT+WCH=n       - set wifi channel 1-14 (auto-save, raw TX only, AT+HOTRESTART to apply)\r\n");
     at_send_str("+HELP:AT+XPORT?      - show transport (0=UDP 1=TCP 2=RawTX)\r\n");
-    at_send_str("+HELP:AT+XPORT=0|1|2 - set transport (HOTRESTART/RST to apply)\r\n");
+    at_send_str("+HELP:AT+XPORT=0|1|2 - set transport (AT+RST to apply)\r\n");
     at_send_str("+HELP:AT+TIMING?     - show I2S RX input delays (sd,ws,bck)\r\n");
     at_send_str("+HELP:AT+TIMING=s,w,b - set I2S RX delays 0-3 each (auto-save, hotrestart)\r\n");
 #if BATTERY_ENABLED
@@ -566,16 +574,17 @@ static void cmd_help_impl(void)
     at_send_data("+HELP:  Bits: %u-bit (use AT+BITS to change)\r\n", cfg.bits_per_sample);
     at_send_data("+HELP:  Gain: %u (use AT+GAIN to change, 0=bypass)\r\n", (unsigned)cfg.gain);
     {
-        const agc_preset_t *p = (cfg.agc_mode < AGC_MODE_COUNT) ?
-            &AGC_PRESETS[cfg.agc_mode] : &AGC_PRESETS[0];
+        const agc_preset_t *p = (cfg.agc_mode < AGC_MODE_COUNT) ? &AGC_PRESETS[cfg.agc_mode] : &AGC_PRESETS[0];
         at_send_data("+HELP:  AGC: %u %s (use AT+AGC to change, 0-8)\r\n",
                      (unsigned)cfg.agc_mode, p->name);
     }
     at_send_data("+HELP:  CODEC: %u (use AT+CODEC to change, 0=ADPCM 1=PCM)\r\n", (unsigned)cfg.codec_mode);
     {
         const char *xname = "UDP";
-        if (cfg.transport_mode == TRANSPORT_MODE_TCP) xname = "TCP";
-        else if (cfg.transport_mode == TRANSPORT_MODE_RAWTX) xname = "Raw 802.11 TX";
+        if (cfg.transport_mode == TRANSPORT_MODE_TCP)
+            xname = "TCP";
+        else if (cfg.transport_mode == TRANSPORT_MODE_RAWTX)
+            xname = "Raw 802.11 TX";
         at_send_data("+HELP:  Transport: %u %s (use AT+XPORT to change, 0=UDP 1=TCP 2=RawTX)\r\n",
                      (unsigned)cfg.transport_mode, xname);
     }
@@ -600,7 +609,7 @@ static void cmd_wifi_query(void)
 /* FIX (2-E HIGH #11): see FIXES.md.  FIX (4-E LOW): see FIXES.md.
  * Parse AT+WIFI=ssid,password (quoted form allows commas; \" escapes). Returns 0/-1. */
 static int parse_wifi_args(const char *args, char *ssid, size_t ssid_sz,
-                            char *pwd, size_t pwd_sz)
+                           char *pwd, size_t pwd_sz)
 {
     const char *p = args;
     size_t i;
@@ -608,13 +617,13 @@ static int parse_wifi_args(const char *args, char *ssid, size_t ssid_sz,
     if (*p == '"')
     {
         /* Quoted SSID — handle \" escapes. */
-        p++;  /* skip opening quote */
+        p++; /* skip opening quote */
         i = 0;
         while (*p && *p != '"')
         {
             /* FIX (4-E LOW): see FIXES.md — check buffer limit before write. */
             if (i >= ssid_sz - 1)
-                return -1;  /* SSID too long */
+                return -1; /* SSID too long */
             if (*p == '\\' && p[1] == '"')
             {
                 ssid[i++] = '"';
@@ -626,27 +635,37 @@ static int parse_wifi_args(const char *args, char *ssid, size_t ssid_sz,
             }
         }
         if (*p != '"')
-            return -1;  /* unterminated quote */
-        p++;  /* skip closing quote */
+            return -1; /* unterminated quote */
+        p++;           /* skip closing quote */
         ssid[i] = '\0';
     }
     else
     {
         /* Unquoted SSID — no commas allowed (comma is the separator). */
         const char *end = strchr(p, ',');
-        if (!end)
-            return -1;
-        size_t len = (size_t)(end - p);
-        if (len >= ssid_sz)
+        size_t len;
+        if (end)
+        {
+            len = (size_t)(end - p);
+        }
+        else
+        {
+            /* No comma — SSID is the entire remaining string (open network). */
+            len = strlen(p);
+        }
+        if (len == 0 || len >= ssid_sz)
             return -1;
         memcpy(ssid, p, len);
         ssid[len] = '\0';
         p = end;
     }
 
-    if (*p != ',')
-        return -1;
-    p++;  /* skip comma */
+    /* Password is optional: absent = open network. */
+    pwd[0] = '\0';
+    if (p == NULL || *p != ',')
+        return 0; /* no comma → no password → open network */
+    p++;          /* skip comma */
+
     /* FIX (4-E LOW): see FIXES.md — skip leading whitespace before unquoted pwd. */
     while (*p == ' ' || *p == '\t')
         p++;
@@ -654,12 +673,12 @@ static int parse_wifi_args(const char *args, char *ssid, size_t ssid_sz,
     if (*p == '"')
     {
         /* Quoted password — handle \" escapes. */
-        p++;  /* skip opening quote */
+        p++; /* skip opening quote */
         i = 0;
         while (*p && *p != '"')
         {
             if (i >= pwd_sz - 1)
-                return -1;  /* password too long */
+                return -1; /* password too long */
             if (*p == '\\' && p[1] == '"')
             {
                 pwd[i++] = '"';
@@ -671,21 +690,21 @@ static int parse_wifi_args(const char *args, char *ssid, size_t ssid_sz,
             }
         }
         if (*p != '"')
-            return -1;  /* unterminated quote */
-        p++;  /* skip closing quote */
+            return -1; /* unterminated quote */
+        p++;           /* skip closing quote */
         pwd[i] = '\0';
         /* Validate: only whitespace or end-of-string allowed after quoted password */
         while (*p == ' ' || *p == '\t')
             p++;
         if (*p != '\0')
-            return -1;  /* trailing garbage */
+            return -1; /* trailing garbage */
     }
     else
     {
         /* Unquoted password — rest of string */
         size_t len = strlen(p);
         /* Strip trailing whitespace (spaces, tabs, CR, LF) */
-        while (len > 0 && (p[len-1] == ' ' || p[len-1] == '\t' || p[len-1] == '\r' || p[len-1] == '\n'))
+        while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' || p[len - 1] == '\r' || p[len - 1] == '\n'))
             len--;
         if (len >= pwd_sz)
             return -1;
@@ -718,15 +737,17 @@ static void cmd_wifi_set(const char *args)
         return;
     }
 
-    if (!ssid[0] || !pwd[0])
+    if (!ssid[0])
     {
         memset(pwd, 0, sizeof(pwd));
-        at_send_data("+ERR:ssid and password required\r\n");
+        at_send_data("+ERR:ssid required\r\n");
         at_send_error();
         return;
     }
 
-    /* FIX (AUDIT-MEDIUM): see FIXES.md — validate WPA2 password length (8-63). */
+    /* Password is optional: empty = open network.
+     * If present, WPA2 mandates 8-63 characters. */
+    if (pwd[0])
     {
         size_t plen = strlen(pwd);
         if (plen < 8 || plen > 63)
@@ -738,7 +759,7 @@ static void cmd_wifi_set(const char *args)
             return;
         }
     }
-
+    bool is_open = !pwd[0];
     esp_err_t err = config_set_wifi(ssid, pwd);
     if (err != ESP_OK)
     {
@@ -758,7 +779,10 @@ static void cmd_wifi_set(const char *args)
         return;
     }
 
-    at_send_data("+WIFI:set to ssid=\"%s\" (saved, reconnecting)\r\n", ssid);
+    if (is_open)
+        at_send_data("+WIFI:set to ssid=\"%s\" OPEN (saved, reconnecting)\r\n", ssid);
+    else
+        at_send_data("+WIFI:set to ssid=\"%s\" (saved, reconnecting)\r\n", ssid);
     at_send_ok();
 }
 
@@ -1198,10 +1222,16 @@ static void cmd_xport_query(void)
     const char *name;
     switch (cfg.transport_mode)
     {
-    case TRANSPORT_MODE_TCP:   name = "TCP"; break;
-    case TRANSPORT_MODE_RAWTX: name = "Raw 802.11 TX"; break;
+    case TRANSPORT_MODE_TCP:
+        name = "TCP";
+        break;
+    case TRANSPORT_MODE_RAWTX:
+        name = "Raw 802.11 TX";
+        break;
     case TRANSPORT_MODE_UDP:
-    default:                   name = "UDP"; break;
+    default:
+        name = "UDP";
+        break;
     }
     at_send_data("+XPORT:%u (%s)\r\n", (unsigned)cfg.transport_mode, name);
     at_send_ok();
@@ -1397,9 +1427,8 @@ static void cmd_status_impl(void)
     svc_port_status_t st;
     svc_port_get_status(&st);
 
-
-//extern void mxr_dump(void);
- //mxr_dump();
+    extern void mxr_dump(void);
+    mxr_dump();
 
     at_send_data("+STATUS:firmware=" FIRMWARE_VERSION "\r\n");
     at_send_data("+STATUS:wifi_ssid=\"%s\"\r\n", cfg.wifi_ssid);
@@ -1446,8 +1475,7 @@ static void cmd_status_impl(void)
     at_send_data("+STATUS:bits_per_sample=%u\r\n", (unsigned)cfg.bits_per_sample);
     at_send_data("+STATUS:gain=%u (0=bypass, 32=+30dB)\r\n", (unsigned)cfg.gain);
     {
-        const agc_preset_t *ap = (cfg.agc_mode < AGC_MODE_COUNT) ?
-            &AGC_PRESETS[cfg.agc_mode] : &AGC_PRESETS[0];
+        const agc_preset_t *ap = (cfg.agc_mode < AGC_MODE_COUNT) ? &AGC_PRESETS[cfg.agc_mode] : &AGC_PRESETS[0];
         at_send_data("+STATUS:agc=%u (%s, attack=%u, release=%u)\r\n",
                      (unsigned)cfg.agc_mode, ap->name,
                      (unsigned)ap->attack, (unsigned)ap->release);
@@ -1456,8 +1484,10 @@ static void cmd_status_impl(void)
                  cfg.codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM");
     {
         const char *xname = "UDP";
-        if (cfg.transport_mode == TRANSPORT_MODE_TCP) xname = "TCP";
-        else if (cfg.transport_mode == TRANSPORT_MODE_RAWTX) xname = "Raw 802.11 TX";
+        if (cfg.transport_mode == TRANSPORT_MODE_TCP)
+            xname = "TCP";
+        else if (cfg.transport_mode == TRANSPORT_MODE_RAWTX)
+            xname = "Raw 802.11 TX";
         at_send_data("+STATUS:transport_config=%u (%s)\r\n",
                      (unsigned)cfg.transport_mode, xname);
     }
@@ -1468,8 +1498,10 @@ static void cmd_status_impl(void)
     {
         uint8_t active = stream_mode_current_transport();
         const char *xname = "UDP";
-        if (active == TRANSPORT_MODE_TCP) xname = "TCP";
-        else if (active == TRANSPORT_MODE_RAWTX) xname = "Raw 802.11 TX";
+        if (active == TRANSPORT_MODE_TCP)
+            xname = "TCP";
+        else if (active == TRANSPORT_MODE_RAWTX)
+            xname = "Raw 802.11 TX";
         at_send_data("+STATUS:transport_active=%u (%s)\r\n",
                      (unsigned)active, xname);
     }
@@ -1524,7 +1556,8 @@ static void cmd_status_impl(void)
     {
         /* Bitrate depends on codec: ADPCM=4 bits/sample, PCM=bits_per_sample. */
         unsigned bits_per_codec = (cfg.codec_mode == CODEC_MODE_PCM)
-                                      ? cfg.bits_per_sample : 4;
+                                      ? cfg.bits_per_sample
+                                      : 4;
         at_send_data("+STATUS:bitrate=%u\r\n",
                      (unsigned)(cfg.sample_rate * bits_per_codec *
                                 channel_format_to_count(cfg.channel_format)));
@@ -1564,8 +1597,8 @@ static void cmd_factory_impl(void)
     at_send_ok();
 
     /* FIX (2-E HIGH #12): see FIXES.md — reboot so hostname/port changes apply. */
-    vTaskDelay(pdMS_TO_TICKS(200));  /* let UART flush the +OK response */
-    esp_restart();  /* never returns */
+    vTaskDelay(pdMS_TO_TICKS(200)); /* let UART flush the +OK response */
+    esp_restart();                  /* never returns */
     /* unreachable */
 }
 

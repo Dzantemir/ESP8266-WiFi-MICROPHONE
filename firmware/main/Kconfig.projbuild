@@ -373,7 +373,9 @@ menu "ADPCM Streamer Configuration"
             string "Default WiFi password"
             default "12345678"
             help
-                Default WiFi password. Runtime: AT+WIFI.
+                Default WiFi password. Must be 8-63 characters (WPA2 requirement).
+                Leave EMPTY for open (no-password) networks.
+                Runtime: AT+WIFI=ssid,password or AT+WIFI=ssid (open).
 
         config STREAMER_WIFI_HOSTNAME
             string "WiFi hostname"

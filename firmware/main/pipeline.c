@@ -128,8 +128,6 @@ static SemaphoreHandle_t s_task_done_sems[TASK_IDX_COUNT] = {NULL};
 /* FIX (MEDIUM #37): see FIXES.md — mutex guarding s_task_handles[]. */
 SemaphoreHandle_t s_task_handles_mutex = NULL; /* extern */
 
-/* FIX (AUDIT-XPORT-AUTOAPPLY): see FIXES.md */
-bool s_pending_transport_apply = false; /* extern */
 
 /* Boot-time WiFi state. */
 bool s_wifi_initialized = false; /* extern */
@@ -1046,65 +1044,22 @@ esp_err_t start_streaming(void)
     const stream_mode_ops_t *ops = old_ops; /* default: no change */
     bool transport_changed_in_nvs = (cfg.transport_mode != old_transport);
 
-    if (transport_changed_in_nvs && !s_pending_transport_apply)
+    if (transport_changed_in_nvs)
     {
-        /* Server-initiated stop+start (NOT a user HOTRESTART). Refuse the
-         * transport change - keep the old transport. The user must explicitly
-         * do AT+HOTRESTART or AT+RST to apply the change. Do NOT call
-         * stream_mode_init() with the new cfg - it would overwrite
-         * s_active_ops. Just log and continue with old_ops. */
-        ESP_LOGW(TAG, "Transport changed in NVS (%s -> %s) but no "
-                      "HOTRESTART requested - keeping old transport (%s). "
-                      "AT+RST to apply.",
-                 old_ops->name,
-                 (cfg.transport_mode == TRANSPORT_MODE_UDP) ? "UDP" : (cfg.transport_mode == TRANSPORT_MODE_TCP) ? "TCP"
-                                                                                                                 : "Raw 802.11 TX",
-                 old_ops->name);
-        /* Override cfg.transport_mode to the OLD value so the rest of
-         * start_streaming (logging, packet header) uses the old transport.
-         * s_active_ops stays as old_ops (we never called stream_mode_init). */
+        /* Transport change ALWAYS requires AT+RST (full reboot).
+          * Neither HOTRESTART nor server-initiated stop+start applies it.
+          * NVS already holds the new value; it takes effect after reboot. */
+        ESP_LOGW(TAG, "Transport changed in NVS (%s -> %s) - "
+                       "AT+RST required to apply. Keeping old transport (%s) "
+                       "for this stream.",
+                  old_ops->name,
+                  (cfg.transport_mode == TRANSPORT_MODE_UDP)    ? "UDP" :
+                  (cfg.transport_mode == TRANSPORT_MODE_TCP)    ? "TCP"
+                                                                : "Raw 802.11 TX",
+                  old_ops->name);
         cfg.transport_mode = old_transport;
-        /* ops == old_ops (no change). Stream starts with OLD transport. */
+        /* ops stays == old_ops — stream continues on the OLD transport. */
     }
-    else if (transport_changed_in_nvs)
-    {
-        /* HOTRESTART was explicitly requested. Check compatibility BEFORE
-         * touching global state: peek at the target ops table without
-         * calling stream_mode_init(), so s_active_transport never holds
-         * a transient value that svc_port's build_info_payload() could
-         * read mid-switch (M1 fix). */
-        const stream_mode_ops_t *new_ops = stream_mode_ops_for(cfg.transport_mode);
-
-        if (old_ops->needs_wifi_association != new_ops->needs_wifi_association)
-        {
-            /* FIX (AUDIT-XPORT-CRASH): see FIXES.md */
-            ESP_LOGW(TAG, "Transport change %s -> %s requires AT+RST "
-                          "(WiFi mode differs). Keeping old transport (%s) "
-                          "for this stream. Other settings (audio, WiFi ch) "
-                          "are still applied.",
-                     old_ops->name, new_ops->name, old_ops->name);
-            /* Revert cfg so the rest of start_streaming (logging, packet
-             * header) uses the old transport. Global state untouched —
-             * stream_mode_init() was never called. */
-            cfg.transport_mode = old_transport;
-            /* ops stays == old_ops (no change). */
-        }
-        else
-        {
-            /* UDP <-> TCP transition via HOTRESTART - safe to apply on
-             * the fly. Single stream_mode_init() call — no transient
-             * s_active_transport visible to other tasks. */
-            ESP_LOGI(TAG, "Transport changed -- deinitializing old transport (%s)",
-                     old_ops->name);
-            old_ops->deinit();
-            stream_mode_init(&cfg);
-            ops = stream_mode_ops();
-        }
-    }
-    /* Clear the pending flag - the change has been applied, refused, or
-     * there was no change. Either way, the next start_streaming requires
-     * a fresh HOTRESTART to apply a transport change. */
-    s_pending_transport_apply = false;
 
     /* Resolve stream destination (UDP: from server CONFIGURE; RAWTX: none). */
     uint32_t stream_host = 0;
@@ -1239,13 +1194,21 @@ esp_err_t start_streaming(void)
     if (cfg.transport_mode == TRANSPORT_MODE_RAWTX && s_wifi_initialized &&
         s_rawtx_wifi_channel != cfg.wifi_channel)
     {
-        ESP_LOGI(TAG, "RawTX channel changed %u -> %u, re-initializing WiFi",
-                 (unsigned)s_rawtx_wifi_channel, (unsigned)cfg.wifi_channel);
-        ops->deinit();     /* tear down rawtx transport state (802.11 hdr) */
-        wifi_sta_deinit(); /* full WiFi deinit — esp_wifi_stop+deinit */
-        s_wifi_initialized = false;
-        /* Will be re-initialized by the !s_wifi_initialized block below, which
-         * also updates s_rawtx_wifi_channel. */
+        if (s_rawtx_wifi_channel == 0)
+        {
+            ESP_LOGI(TAG, "RawTX: recording initial WiFi channel %u (skip reinit)",
+                     (unsigned)cfg.wifi_channel);
+            s_rawtx_wifi_channel = cfg.wifi_channel;
+        }
+        else
+        {
+            /* Реальная смена канала (AT+WCH + HOTRESTART) */
+            ESP_LOGI(TAG, "RawTX channel changed %u -> %u, re-initializing WiFi",
+                     (unsigned)s_rawtx_wifi_channel, (unsigned)cfg.wifi_channel);
+            ops->deinit();
+            wifi_sta_deinit();
+            s_wifi_initialized = false;
+        }
     }
 
     if (!s_wifi_initialized)

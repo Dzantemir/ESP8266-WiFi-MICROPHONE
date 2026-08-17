@@ -44,6 +44,12 @@ extern "C"
 #define MXR_PARSED_REGION_COUNT 1
 #endif
 
+#ifdef CONFIG_MXR_DESC_BINARY_SEARCH
+#define MXR_DESC_BINARY_SEARCH_ACTIVE 1
+#else
+#define MXR_DESC_BINARY_SEARCH_ACTIVE 0
+#endif
+
 #if MXR_PARSED_REGION_COUNT > MXR_REGIONS_MAX
 #undef MXR_PARSED_REGION_COUNT
 #define MXR_PARSED_REGION_COUNT MXR_REGIONS_MAX
@@ -388,6 +394,10 @@ typedef uint32_t mxr_count_t;
    * ================================================================ */
   static inline size_t MXR_IRAM_INLINE_ATTR mxr_align4(size_t bytes)
   {
+    if (bytes > (SIZE_MAX - MXR_ALIGN_MASK))
+    {
+      return SIZE_MAX;
+    }
     return (bytes + MXR_ALIGN_MASK) & ~(size_t)MXR_ALIGN_MASK;
   }
 

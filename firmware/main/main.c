@@ -33,7 +33,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"   /* xSemaphoreCreateMutex (s_task_handles_mutex) */
+#include "freertos/semphr.h" /* xSemaphoreCreateMutex (s_task_handles_mutex) */
 #include "freertos/event_groups.h"
 
 #include "esp_system.h"
@@ -51,7 +51,7 @@
 #include "battery.h"
 #include "stream_mode.h"
 #include "stream_control.h"
-#include "pipeline_internal.h"  /* start_streaming/stop_streaming/supervisor_task_fn/etc. */
+#include "pipeline_internal.h" /* start_streaming/stop_streaming/supervisor_task_fn/etc. */
 
 static const char *TAG = "main";
 
@@ -175,7 +175,7 @@ void app_main(void)
         ESP_LOGE(TAG, "NVS init failed: %s - rebooting in 5s", esp_err_to_name(err));
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
-        return;  /* unreachable, but keeps compiler happy */
+        return; /* unreachable, but keeps compiler happy */
     }
 
     /* 1. Battery monitoring (optional, ported from ESP8285-WEBSERVER).
@@ -257,7 +257,7 @@ void app_main(void)
     if (err == ESP_OK)
     {
         s_wifi_initialized = true;
-
+        
 #if WIFI_BOOT_RETRY_ENABLED
         /* FIX (wifi-boot-retry): see FIXES.md */
         wifi_boot_retry_or_sleep(cfg.transport_mode);
