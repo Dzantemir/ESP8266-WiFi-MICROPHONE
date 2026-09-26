@@ -55,8 +55,10 @@ menu "MxR-Malloc"
             Selects where the allocation descriptor tables are stored.
 
             Only the descriptor arrays themselves can be moved to IRAM.
-            Scalar allocator state is intentionally kept in DRAM because
-            ESP8266 IRAM does not support byte/half-word accesses safely.
+            Where the rest of the allocator state (status + regions) goes
+            is a separate choice, "Allocator state placement" below.
+            ESP8266 IRAM does not support byte/half-word accesses safely,
+            so IRAM-resident state requires 32-bit-wide fields.
 
             DRAM placement is the safest default.
             IRAM placement may reduce DRAM usage, but consumes precious
@@ -93,6 +95,44 @@ menu "MxR-Malloc"
 
             Use this only if you have a patched linker script that
             properly defines and reserves the .iram0.bss section.
+
+    endchoice
+
+    # ============================================================
+    #  Allocator state placement: status + region arrays
+    # ============================================================
+    #
+    #  Both options remove the sub-32-bit accesses to IRAM, which the
+    #  SDK emulates in LoadStoreErrorHandler (a full exception per
+    #  access). They differ in what they cost.
+    #
+    choice
+        prompt "Allocator state placement (status + regions)"
+        depends on MXR_DESC_IN_IRAM_TEXT || MXR_DESC_IN_IRAM_BSS
+        default MXR_STATE_IN_IRAM
+        help
+            Where to keep s_stats, s_region[] and s_iram_fb_region[].
+
+            Variant A - "DRAM":
+                Drop the IRAM attribute from the state objects.
+                IRAM -632 B, DRAM +632 B. Field widths stay natural
+                (CONFIG_MXR_COMPACT_TYPES still applies). Smallest
+                change, but the extra .bss eats DRAM.
+
+            Variant B - "IRAM":
+                Keep the state in IRAM and force every field of the
+                placed types to 32 bits (MXR_FIELD_*), with a static
+                assertion barrier against regressions.
+                IRAM +48 B, DRAM +0 B. CONFIG_MXR_COMPACT_TYPES stops
+                applying to mxr_region_t / mxr_status_t.
+
+            Both are correct; pick B if DRAM is scarce, A if IRAM is.
+
+    config MXR_STATE_IN_DRAM
+        bool "DRAM - variant A: no IRAM attribute, IRAM -632 B / DRAM +632 B"
+
+    config MXR_STATE_IN_IRAM
+        bool "IRAM - variant B: 32-bit fields, DRAM +0 B / IRAM +48 B"
 
     endchoice
 
@@ -850,5 +890,160 @@ menu "MxR-Malloc"
             active. Use only for deep heap analysis.
 
     endchoice
+
+
+
+    menu "Optimization"
+
+    config MXR_QUICK_FIT_HINT_ENABLE
+        bool "Quick-fit hint (O(1) fast path)"
+        default y
+        help
+            The quick-fit hint remembers one certainly-free gap per DRAM
+            region, giving an O(1) allocation fast path.
+
+            ON by default. Turn it off to remove the fast path entirely
+            (every allocation then scans the descriptor table) - useful
+            for A/B measurement of the fast path.
+
+            Note: MXR_BINNING depends on this option.
+
+
+    config MXR_CANARY
+        bool "Block canaries (detect payload overwrite/underwrite)"
+        default n
+        help
+            Adds an 8-byte overhead per block: a 4-byte head canary and
+            a 4-byte tail canary written on every successful allocation
+            and checked on free()/realloc().
+
+            On violation the allocator logs the block offset/length and
+            SKIPS the free (the block leaks, but the heap stays
+            consistent and the evidence block is preserved). Counter:
+            mxr_get_status().canary_violations.
+
+            Overhead: +8 B per block (higher memory usage; on small
+            blocks ~+30%).
+
+    config MXR_DOUBLE_FREE_DETECT
+        bool "Double-free detection (ring of recent frees)"
+        default n
+        help
+            Keeps a small FIFO ring of the most recently freed blocks
+            (offset + length + arena). A free() whose descriptor is not
+            found but whose offset matches a ring entry is classified
+            as a double-free: it is logged, counted
+            (mxr_get_status().double_free_detects) and skipped.
+
+            A stale pointer reused via realloc() cannot be detected
+            with plain pointers; combine with block canaries for the
+            common corruption patterns.
+
+    config MXR_DFD_RING_SIZE
+        int "Double-free ring size (entries)"
+        depends on MXR_DOUBLE_FREE_DETECT
+        default 16
+        range 4 256
+        help
+            Number of recent frees kept for classification. Each entry
+            costs 8 bytes.
+
+    config MXR_BINNING
+        bool "Binning: segregated LRU free gaps per size class"
+        depends on MXR_QUICK_FIT_HINT_ENABLE
+        default n
+        help
+            Replaces the single quick-fit hint slot with one LRU gap per
+            logarithmic size class (classes: 32, 64, 128, ... bytes,
+            MXR_BIN_COUNT of them). Small-block allocation
+            (e.g. 32/64-byte structs) hits its own bin instead of
+            competing for the single hint slot.
+
+            Extra per-allocation cost when a gap fits: O(BIN_COUNT)
+            check of the other bin slots to keep invariants.
+
+    config MXR_BIN_COUNT
+        int "Number of bins (size classes)"
+        depends on MXR_BINNING
+        default 4
+        range 2 8
+        help
+            Logarithmic classes starting at 32 bytes (32, 64, 128, 256).
+
+    config MXR_BIG_GAP_GUARD
+        bool "Big-gap guard (prevent premature carving of large gaps)"
+        default n
+        help
+            Relaxes the early-exit acceptance rule: a gap with more
+            waste than the usual best-fit limit may be taken early
+            (skipping the full table scan), but ONLY if the gap is not
+            disproportionately big for the request:
+              gap <= max(BIG_GAP_MIN, request * 2^FACTOR_SHIFT).
+            Gaps above that threshold are never cut prematurely, so
+            very large free blocks ("batons") stay intact for large
+            requests. Counter: mxr_get_status().bgg_relaxed_accepts.
+
+    config MXR_BIG_GAP_MIN
+        int "Big-gap guard: minimum gap size guarded (bytes)"
+        depends on MXR_BIG_GAP_GUARD
+        default 1024
+        help
+            Absolute threshold protecting gaps regardless of the
+            request size.
+
+    config MXR_BIG_GAP_FACTOR_SHIFT
+        int "Big-gap guard: size factor (log2)"
+        depends on MXR_BIG_GAP_GUARD
+        default 2
+        range 0 6
+        help
+            A gap larger than request << SHIFT (and > GAP_MIN) will not
+            be cut prematurely. 2 = gaps bigger than 4x the request.
+
+    config MXR_DESC_DYNAMIC
+        bool "Dynamic descriptor table (carved from the DRAM heap tail)"
+        depends on !MXR_DESC_IN_IRAM_TEXT && !MXR_DESC_IN_IRAM_BSS
+        default n
+        help
+            The DRAM descriptor table lives inside the heap arena tail
+            ([s_arena_total_bytes, arena end)) and grows/shrinks in
+            CHUNK-sized steps as needed, so a large worst-case
+            MXR_MAX_DESC no longer wastes RAM when the heap actually
+            holds few blocks. The ceiling is still MXR_MAX_DESC, so the
+            worst-case reservation is identical to the static mode.
+
+            Grow needs a free arena tail; when it cannot grow the
+            allocator reports table-full exactly like the static mode.
+
+    config MXR_DESC_INIT
+        int "Dynamic tables: initial capacity (descriptors)"
+        depends on MXR_DESC_DYNAMIC
+        default 32
+        range 4 1024
+        help
+            Initial number of descriptor slots carved from the heap
+            tail (also the minimum it shrinks back to).
+
+    config MXR_DESC_CHUNK
+        int "Dynamic tables: grow/shrink chunk (descriptors)"
+        depends on MXR_DESC_DYNAMIC
+        default 16
+        range 4 256
+        help
+            Step for growing (and shrinking, with a 2-chunk hysteresis).
+            Each chunk costs CHUNK*sizeof(descriptor) bytes of heap.
+
+    config MXR_IRAM_DESC_DYNAMIC
+        bool "Dynamic descriptor table for IRAM fallback heap"
+        depends on MXR_USE_IRAM && MXR_IRAM_FALLBACK_ENABLED
+        default n
+        help
+            Same dynamic table scheme for the IRAM fallback heap: the
+            table is carved from the IRAM arena tail (after the last
+            fallback region) and grows/shrinks in chunks, ceiling
+            MXR_IRAM_MAX_DESC. If there is no fallback region, the
+            table is placed but can never grow.
+
+    endmenu
 
 endmenu

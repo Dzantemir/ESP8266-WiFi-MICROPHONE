@@ -30,6 +30,12 @@ static const char *TAG = "wifi_sta";
 #define WIFI_EVT_APPLY_CACHED (1 << 5)
 
 #define WIFI_EVT_REINIT_SOCKET (1 << 6)
+/* B1 fix: link-layer association state (set on STA_CONNECTED, cleared on
+ * STA_DISCONNECTED). WIFI_EVT_CONNECTED keeps its old meaning "has an IP". */
+#define WIFI_EVT_LINK_UP (1 << 7)
+/* B1 fix: "associated, waiting for DHCP" — the reconnect task arms the
+ * static-IP fallback timer on this bit instead of applying the cache at once. */
+#define WIFI_EVT_DHCP_WAIT (1 << 8)
 
 static EventGroupHandle_t s_wifi_evt = NULL;
 static SemaphoreHandle_t s_backoff_mtx = NULL;
@@ -44,8 +50,57 @@ static TaskHandle_t s_reconnect_task = NULL;
 
 static volatile bool s_intentional_disconnect = false;
 
+/* Last DHCP lease. All fields below are protected by s_backoff_mtx.
+ * B1 fix: the lease is bound to the BSSID it was obtained from and is used
+ * ONLY as a fallback when DHCP stays silent after association (see
+ * WIFI_DHCP_FALLBACK_MS), never blindly on every reconnect. */
 static bool s_have_cached_ip = false;
 static tcpip_adapter_ip_info_t s_cached_ip_info;
+static uint8_t s_cached_bssid[6] = {0};
+/* BSSID of the AP we are currently associated with (from STA_CONNECTED). */
+static uint8_t s_link_bssid[6] = {0};
+/* True while the interface runs on the statically applied cached lease
+ * (DHCP client stopped). Cleared by every real GOT_IP. */
+static bool s_static_fallback = false;
+static TickType_t s_static_since = 0;
+
+/* Map the menuconfig power-save selection to the SDK enum. */
+static wifi_ps_type_t wifi_ps_mode_from_cfg(void)
+{
+    switch (WIFI_PS_MODE_CFG)
+    {
+    case WIFI_PS_MODE_NONE:
+        return WIFI_PS_NONE;
+    case WIFI_PS_MODE_MIN_MODEM:
+        return WIFI_PS_MIN_MODEM;
+    default:
+        return WIFI_PS_MAX_MODEM;
+    }
+}
+
+static const char *wifi_ps_mode_name(wifi_ps_type_t ps)
+{
+    return (ps == WIFI_PS_NONE) ? "NONE" : (ps == WIFI_PS_MIN_MODEM) ? "MIN_MODEM"
+                                                                      : "MAX_MODEM";
+}
+
+/* Forget the cached lease (new credentials / deinit). */
+static void wifi_cache_clear(void)
+{
+    if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, pdMS_TO_TICKS(500)) == pdTRUE)
+    {
+        s_have_cached_ip = false;
+        memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
+        memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+        s_static_fallback = false;
+        xSemaphoreGive(s_backoff_mtx);
+    }
+    else
+    {
+        s_have_cached_ip = false; /* best-effort */
+        s_static_fallback = false;
+    }
+}
 
 extern esp_err_t wifi_set_user_fixed_rate(uint8_t enable_mask, uint8_t rate);
 #define FIXED_RATE_MASK_STA 0x01
@@ -75,11 +130,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         case WIFI_EVENT_STA_START:
             ESP_LOGI(TAG, "WIFI_EVENT_STA_START - connecting...");
 
-            esp_err_t err = esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+            /* Power-save mode from menuconfig (STREAMER_WIFI_PS_MODE). */
+            wifi_ps_type_t ps_mode = wifi_ps_mode_from_cfg();
+            esp_err_t err = esp_wifi_set_ps(ps_mode);
             if (err != ESP_OK)
             {
-                ESP_LOGW(TAG, "esp_wifi_set_ps failed: %s", esp_err_to_name(err));
+                ESP_LOGW(TAG, "esp_wifi_set_ps(%s) failed: %s",
+                         wifi_ps_mode_name(ps_mode), esp_err_to_name(err));
                 s_ctx.config_err = err;
+            }
+            else
+            {
+                ESP_LOGI(TAG, "WiFi power save: %s", wifi_ps_mode_name(ps_mode));
             }
 
             wifi_country_t country_config = {
@@ -144,7 +206,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                 ESP_LOGW(TAG, "STA_DISCONNECTED event with NULL data");
                 break;
             }
-            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP |
+                                                 WIFI_EVT_LINK_UP | WIFI_EVT_DHCP_WAIT);
 
             if (streaming_is_active())
             {
@@ -170,19 +233,57 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         }
 
         case WIFI_EVENT_STA_CONNECTED:
+        {
+            /* B1 fix. Previously the cached lease was applied immediately
+             * (DHCP stopped) on every association — also after AT+WIFI moved
+             * the device to a different network, which left it on a foreign
+             * subnet until reboot, and the lease was never renewed.
+             *
+             * Now: remember the BSSID we associated with, drop the cache if
+             * it belongs to another AP, and always let DHCP run first. The
+             * cache is only applied by the reconnect task if DHCP stays
+             * silent for WIFI_DHCP_FALLBACK_MS (see WIFI_EVT_DHCP_WAIT). */
+            wifi_event_sta_connected_t *cevt = data;
+            bool cache_usable = false;
 
-            if (s_have_cached_ip)
+            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
             {
-                ESP_LOGI(TAG, "STA_CONNECTED - cached IP available, signaling task");
-                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_APPLY_CACHED);
+                if (cevt)
+                    memcpy(s_link_bssid, cevt->bssid, sizeof(s_link_bssid));
+                else
+                    memset(s_link_bssid, 0, sizeof(s_link_bssid));
+
+                if (s_have_cached_ip &&
+                    (!cevt || memcmp(s_cached_bssid, cevt->bssid, sizeof(s_cached_bssid)) != 0))
+                {
+                    ESP_LOGW(TAG, "STA_CONNECTED - different AP than the cached lease, "
+                                  "dropping cached IP " IPSTR,
+                             IP2STR(&s_cached_ip_info.ip));
+                    s_have_cached_ip = false;
+                    memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
+                    memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+                }
+                s_static_fallback = false;
+                cache_usable = s_have_cached_ip;
+                xSemaphoreGive(s_backoff_mtx);
+            }
+
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_LINK_UP);
+
+            if (cache_usable && WIFI_DHCP_FALLBACK_MS > 0)
+            {
+                ESP_LOGI(TAG, "STA_CONNECTED - waiting for DHCP (static fallback armed, %u ms)",
+                         (unsigned)WIFI_DHCP_FALLBACK_MS);
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
             }
             else
             {
-                ESP_LOGI(TAG, "STA_CONNECTED - waiting for DHCP (first boot)");
+                ESP_LOGI(TAG, "STA_CONNECTED - waiting for DHCP");
             }
 
             svc_port_reset_watchdog();
             break;
+        }
 
         case WIFI_EVENT_STA_AUTHMODE_CHANGE:
         {
@@ -283,14 +384,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                               (memcmp(&cached, &evt->ip_info,
                                       sizeof(cached)) != 0);
 
-            /* FIX (HIGH #9): see FIXES.md */
+            /* FIX (HIGH #9): see FIXES.md
+             * B1 fix: the lease is bound to the BSSID of the current
+             * association; a real DHCP answer also ends any static fallback. */
             if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
             {
                 s_cached_ip_info = evt->ip_info;
                 s_have_cached_ip = true;
+                memcpy(s_cached_bssid, s_link_bssid, sizeof(s_cached_bssid));
+                s_static_fallback = false;
                 s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
                 xSemaphoreGive(s_backoff_mtx);
             }
+
+            /* DHCP answered — disarm the static fallback timer. */
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
 
             if (ip_changed)
             {
@@ -301,7 +409,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         }
         else if (id == IP_EVENT_STA_LOST_IP)
         {
-
+            /* Lease expired without renewal (DHCP server gone?). Keep the
+             * last address if it came from this very AP (checked in the
+             * reconnect task), otherwise fall back to a reconnect. */
             ESP_LOGW(TAG, "IP_EVENT_STA_LOST_IP - IP lost, re-applying cached IP");
             xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
             if (streaming_is_active())
@@ -311,24 +421,170 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
+/* B1 fix: apply the cached lease statically — but only if it belongs to the
+ * AP we are associated with right now, and only when the fallback is enabled.
+ * `why` is for the log. Called from the reconnect task only. */
+static void wifi_apply_cached_lease(const char *why)
+{
+    bool have = false;
+    tcpip_adapter_ip_info_t cached;
+    uint8_t cached_bssid[6];
+    uint8_t link_bssid[6];
+
+    memset(&cached, 0, sizeof(cached));
+    memset(cached_bssid, 0, sizeof(cached_bssid));
+    memset(link_bssid, 0, sizeof(link_bssid));
+
+    if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+    {
+        have = s_have_cached_ip;
+        cached = s_cached_ip_info;
+        memcpy(cached_bssid, s_cached_bssid, sizeof(cached_bssid));
+        memcpy(link_bssid, s_link_bssid, sizeof(link_bssid));
+        xSemaphoreGive(s_backoff_mtx);
+    }
+
+    if (!(xEventGroupGetBits(s_wifi_evt) & WIFI_EVT_LINK_UP))
+    {
+        ESP_LOGI(TAG, "%s: not associated - reconnect path will handle it", why);
+        return;
+    }
+
+    if (!have)
+    {
+        /* FIX FR-AT #10: see FIXES.md — nothing to apply, reconnect so DHCP
+         * retries via the standard connect path. */
+        ESP_LOGW(TAG, "%s: no cached IP - requesting reconnect", why);
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+        return;
+    }
+
+    if (WIFI_DHCP_FALLBACK_MS == 0)
+    {
+        /* Static fallback disabled by menuconfig: DHCP only. */
+        ESP_LOGW(TAG, "%s: static fallback disabled - restarting DHCP", why);
+        esp_err_t dh_err = tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+        if (dh_err != ESP_OK && dh_err != ESP_ERR_TCPIP_ADAPTER_DHCP_ALREADY_STARTED)
+            ESP_LOGW(TAG, "dhcpc_start failed: %s", esp_err_to_name(dh_err));
+        return;
+    }
+
+    if (memcmp(cached_bssid, link_bssid, sizeof(cached_bssid)) != 0)
+    {
+        ESP_LOGW(TAG, "%s: cached lease is from another AP - not applying, waiting for DHCP", why);
+        return;
+    }
+
+    ESP_LOGW(TAG, "%s: applying cached IP " IPSTR " statically (DHCP silent)",
+             why, IP2STR(&cached.ip));
+    tcpip_adapter_dhcpc_stop(TCPIP_ADAPTER_IF_STA);
+    esp_err_t ip_err = tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_STA, &cached);
+    if (ip_err == ESP_OK)
+    {
+        svc_port_update_broadcast();
+        if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+        {
+            s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+            s_static_fallback = true;
+            s_static_since = xTaskGetTickCount();
+            xSemaphoreGive(s_backoff_mtx);
+        }
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+        ESP_LOGI(TAG, "Cached IP applied - GOT_IP signaled (DHCP retry in %u s while idle)",
+                 (unsigned)(WIFI_STATIC_REFRESH_MS / 1000U));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "set_ip_info failed: %s - falling back to DHCP",
+                 esp_err_to_name(ip_err));
+        /* FIX F-B #1: DHCP was stopped above; restart it so the interface
+         * can re-acquire an address instead of being left with no IP. */
+        esp_err_t dh_err = tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+        if (dh_err != ESP_OK && dh_err != ESP_ERR_TCPIP_ADAPTER_DHCP_ALREADY_STARTED)
+        {
+            ESP_LOGW(TAG, "dhcpc_start fallback failed: %s",
+                     esp_err_to_name(dh_err));
+        }
+    }
+}
+
+/* Reconnect task poll period: the static-fallback timer and the DHCP refresh
+ * are checked on every wake-up; events still wake the task immediately. */
+#define WIFI_TASK_POLL_MS 1000
+
 static void wifi_reconnect_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "Reconnect task started");
 
+    /* Tick at which WIFI_EVT_DHCP_WAIT was first seen (0 = not armed). */
+    TickType_t dhcp_wait_since = 0;
+
     while (s_initialized)
     {
-        /* FIX (HIGH #2): see FIXES.md */
+        /* FIX (HIGH #2): see FIXES.md
+         * B1 fix: bounded wait instead of portMAX_DELAY so the two timers
+         * below run even when no event arrives. WIFI_EVT_DHCP_WAIT is
+         * deliberately NOT in the mask (it stays set for seconds and would
+         * turn this into a busy loop); it is polled below. */
         EventBits_t bits = xEventGroupWaitBits(
             s_wifi_evt,
             WIFI_EVT_RECONNECT_REQ | WIFI_EVT_APPLY_CACHED |
                 WIFI_EVT_REINIT_SOCKET | WIFI_EVT_EXIT,
             pdFALSE,
             pdFALSE,
-            portMAX_DELAY);
+            pdMS_TO_TICKS(WIFI_TASK_POLL_MS));
 
         if (!s_initialized || (bits & WIFI_EVT_EXIT))
             break;
+
+        /* ---- B1: static-IP fallback timer (armed at STA_CONNECTED) ---- */
+        {
+            const TickType_t fallback_ticks = pdMS_TO_TICKS(WIFI_DHCP_FALLBACK_MS);
+            EventBits_t now_bits = xEventGroupGetBits(s_wifi_evt);
+            if (now_bits & WIFI_EVT_DHCP_WAIT)
+            {
+                TickType_t now = xTaskGetTickCount();
+                if (dhcp_wait_since == 0)
+                    dhcp_wait_since = now ? now : 1;
+                else if ((TickType_t)(now - dhcp_wait_since) >= fallback_ticks)
+                {
+                    xEventGroupClearBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+                    dhcp_wait_since = 0;
+                    if (!(now_bits & WIFI_EVT_GOT_IP))
+                        wifi_apply_cached_lease("DHCP timeout");
+                }
+            }
+            else
+            {
+                dhcp_wait_since = 0;
+            }
+        }
+
+        /* ---- B1: renew the lease while running on the static fallback ---- */
+        {
+            bool do_refresh = false;
+            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+            {
+                if (s_static_fallback && !streaming_is_active() &&
+                    (uint32_t)(xTaskGetTickCount() - s_static_since) >= pdMS_TO_TICKS(WIFI_STATIC_REFRESH_MS))
+                {
+                    s_static_fallback = false;
+                    do_refresh = true;
+                }
+                xSemaphoreGive(s_backoff_mtx);
+            }
+            if (do_refresh && (xEventGroupGetBits(s_wifi_evt) & WIFI_EVT_LINK_UP))
+            {
+                ESP_LOGI(TAG, "static fallback: retrying DHCP to renew the lease");
+                xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+                esp_err_t dh_err = tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+                if (dh_err != ESP_OK && dh_err != ESP_ERR_TCPIP_ADAPTER_DHCP_ALREADY_STARTED)
+                    ESP_LOGW(TAG, "dhcpc_start (refresh) failed: %s", esp_err_to_name(dh_err));
+                /* If DHCP stays silent again, the fallback re-applies the lease. */
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+            }
+        }
 
         if (bits & WIFI_EVT_REINIT_SOCKET)
         {
@@ -350,61 +606,9 @@ static void wifi_reconnect_task(void *arg)
 
         if (bits & WIFI_EVT_APPLY_CACHED)
         {
+            /* IP_EVENT_STA_LOST_IP: lease expired while associated. */
             xEventGroupClearBits(s_wifi_evt, WIFI_EVT_APPLY_CACHED);
-            /* HIGH #9: take a consistent snapshot of the cached IP state. */
-            bool have = false;
-            tcpip_adapter_ip_info_t cached;
-            memset(&cached, 0, sizeof(cached));
-            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
-            {
-                have = s_have_cached_ip;
-                cached = s_cached_ip_info;
-                xSemaphoreGive(s_backoff_mtx);
-            }
-
-            if (have)
-            {
-                ESP_LOGI(TAG, "Applying cached IP " IPSTR, IP2STR(&cached.ip));
-                tcpip_adapter_dhcpc_stop(TCPIP_ADAPTER_IF_STA);
-                esp_err_t ip_err = tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_STA,
-                                                             &cached);
-                if (ip_err == ESP_OK)
-                {
-                    svc_port_update_broadcast();
-                    if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
-                    {
-                        s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
-                        xSemaphoreGive(s_backoff_mtx);
-                    }
-                    xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
-                    ESP_LOGI(TAG, "Cached IP applied - GOT_IP signaled");
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "set_ip_info failed: %s - falling back to DHCP",
-                             esp_err_to_name(ip_err));
-                    /* FIX F-B #1: DHCP was stopped above (line ~324); restart
-                     * it so the interface can re-acquire an address instead
-                     * of being left with no IP at all. */
-                    esp_err_t dh_err = tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
-                    if (dh_err != ESP_OK && dh_err != ESP_ERR_TCPIP_ADAPTER_DHCP_ALREADY_STARTED)
-                    {
-                        ESP_LOGW(TAG, "dhcpc_start fallback failed: %s",
-                                 esp_err_to_name(dh_err));
-                    }
-                }
-            }
-            else
-            {
-                /* FIX FR-AT #10: see FIXES.md — LOST_IP arrived but we have no
-                 * cached IP to re-apply. The APPLY_CACHED branch above only
-                 * handles the "have cached" case; previously the no-cached
-                 * path silently did nothing, leaving the interface with no IP
-                 * and no reconnect attempt. Request a reconnect so DHCP retries
-                 * via the standard connect path. */
-                ESP_LOGW(TAG, "LOST_IP but no cached IP - requesting reconnect");
-                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
-            }
+            wifi_apply_cached_lease("LOST_IP");
         }
 
         if (bits & WIFI_EVT_RECONNECT_REQ)
@@ -484,11 +688,18 @@ static void wifi_raw_event_handler(void *arg, esp_event_base_t base,
 
     ESP_LOGI(TAG, "WIFI_EVENT_STA_START - configuring radio (raw TX mode)");
 
-    esp_err_t err = esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    /* Power-save mode from menuconfig (STREAMER_WIFI_PS_MODE). */
+    wifi_ps_type_t ps_mode = wifi_ps_mode_from_cfg();
+    esp_err_t err = esp_wifi_set_ps(ps_mode);
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "esp_wifi_set_ps failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "esp_wifi_set_ps(%s) failed: %s",
+                 wifi_ps_mode_name(ps_mode), esp_err_to_name(err));
         s_raw_ctx.config_err = err;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "WiFi power save: %s", wifi_ps_mode_name(ps_mode));
     }
 
     err = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
@@ -939,6 +1150,9 @@ esp_err_t wifi_sta_deinit(void)
         {
             s_have_cached_ip = false;
             memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
+            memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+            memset(s_link_bssid, 0, sizeof(s_link_bssid));
+            s_static_fallback = false;
             xSemaphoreGive(s_backoff_mtx);
             /* Temp-pointer pattern: NULL the global first so any concurrent
              * reader sees NULL and skips take. Then delete via local. */
@@ -968,6 +1182,9 @@ esp_err_t wifi_sta_deinit(void)
         s_have_cached_ip = false;
         memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
     }
+    memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+    memset(s_link_bssid, 0, sizeof(s_link_bssid));
+    s_static_fallback = false;
     s_intentional_disconnect = false;
 
     ESP_LOGI(TAG, "WiFi deinitialized");
@@ -1050,6 +1267,13 @@ esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
     if (err != ESP_OK)
         return err;
 
+    /* B1 fix: new credentials may mean a new network — the cached lease
+     * (IP/mask/gateway of the OLD network) must not be re-applied. The BSSID
+     * check in STA_CONNECTED would catch it too, but only if the BSSID
+     * differs; an AP that was re-addressed keeps its BSSID. */
+    wifi_cache_clear();
+    xEventGroupClearBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+
     if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
     {
         s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
@@ -1088,3 +1312,4 @@ esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
 
     return err;
 }
+

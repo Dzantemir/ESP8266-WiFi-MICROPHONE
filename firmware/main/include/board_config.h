@@ -65,6 +65,22 @@
 #error "STREAM_STOP_TIMEOUT_TCP_MS must be > TCP_FRAME_SEND_DEADLINE_MS — total send time exceeds stop timeout"
 #endif
 
+/* F3-A #1b (menuconfig): the whole-frame deadline must be STRICTLY greater
+ * than the per-send SO_SNDTIMEO. The deadline is only checked BETWEEN
+ * send() calls, so a deadline <= the send timeout trips on the first
+ * legitimately slow (but still within-timeout, still making progress)
+ * send() and disconnects a healthy peer. */
+#if (TCP_FRAME_SEND_DEADLINE_MS <= TCP_SEND_TIMEOUT_MS)
+#error "TCP_FRAME_SEND_DEADLINE_MS must be > TCP_SEND_TIMEOUT_MS — one full send() window must fit inside the frame deadline"
+#endif
+
+/* Soft diagnostic (not fatal): EAGAIN retries that can never execute —
+ * the frame deadline expires first and closes the client. The retry
+ * budget is wasted configuration; raise the deadline or lower retries. */
+#if (TCP_EAGAIN_MAX_RETRIES > 0) && \
+    ((TCP_EAGAIN_MAX_RETRIES + 1) * TCP_SEND_TIMEOUT_MS > TCP_FRAME_SEND_DEADLINE_MS)
+#warning "TCP_EAGAIN_MAX_RETRIES too large: (RETRIES + 1) x TCP_SEND_TIMEOUT_MS exceeds TCP_FRAME_SEND_DEADLINE_MS — extra retries never execute before the deadline"
+#endif
 /* M32: BATT_START_MV must be > BATT_CRITICAL_MV (otherwise boot deep-sleep
  * threshold is inverted — device would deep-sleep at boot with OK battery). */
 #if BATTERY_ENABLED

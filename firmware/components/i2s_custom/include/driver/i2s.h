@@ -1,4 +1,4 @@
-﻿// Copyright 2018-2025 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2018-2025 Espressif Systems (Shanghai) PTE LTD
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// REFACTORED:
-// Proper state machine + reference-counted concurrency model.
-// api_lock, tx_users/rx_users, tx_waiters/rx_waiters, idle event group.
-// Public API remains backward compatible.
+// REWORKED ESP8266 I2S driver: explicit lifecycle state machine, reference
+// counted object lifetime, drain-before-reconfigure semantics.
+//
+// Differences from the stock ESP8266_RTOS_SDK driver (same function
+// signatures, slightly different behaviour):
+//   * i2s_write()/i2s_read() return ESP_ERR_INVALID_STATE unless the driver is
+//     RUNNING (SDK: blocked until the timeout expired).
+//   * i2s_stop() / i2s_set_clk() / i2s_zero_dma_buffer() / i2s_driver_uninstall()
+//     first wake and drain any task blocked in i2s_write()/i2s_read()
+//     (SDK: a writer blocked with portMAX_DELAY could hang forever, and
+//     uninstall freed memory underneath it).
+//   * i2s_zero_dma_buffer() stops the DMA, zeroes, and restarts if it was running.
+//   * i2s_driver_uninstall() does NOT delete the event queue (see below).
+//   * i2s_set_clk() rebuilds the DMA buffers when the channel count changes
+//     and does not shrink dma_buf_len permanently.
+//   * i2s_write_expand() is implemented (chunked, no heap allocation).
+//   * 24-bit mode: the sample-rate divider assumes 24 BCK per channel
+//     (bits_mod = 8). The SDK always divided as for 16 bit.
 
 #pragma once
 
@@ -23,7 +37,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "esp_err.h"
-#include "freertos/FreeRTOS.h" // Required for TickType_t used in i2s_read/i2s_write
+#include "freertos/FreeRTOS.h" // TickType_t used in i2s_read/i2s_write
 
 #ifdef __cplusplus
 extern "C"
@@ -50,7 +64,16 @@ extern "C"
     } i2s_channel_t;
 
     /**
-     * @brief I2S communication standard format
+     * @brief I2S communication standard format.
+     *
+     * Effect on the ESP8266 (only the 1-BCK data delay is configurable):
+     *
+     *   I2S_COMM_FORMAT_I2S                            Philips I2S: data delayed by 1 BCK
+     *   I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB  same as above (MSB flag is a no-op)
+     *   I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_LSB  no delay (left-justified / MSB-first)
+     *   I2S_COMM_FORMAT_I2S_MSB alone                  no delay (left-justified), SDK-compatible
+     *
+     * At least one known flag must be set.
      */
     typedef enum
     {
@@ -92,17 +115,17 @@ extern "C"
     } i2s_mode_t;
 
     /**
-     * @brief I2S configuration parameters for i2s_param_config function
+     * @brief I2S configuration parameters for i2s_driver_install
      */
     typedef struct
     {
-        i2s_mode_t mode;                        /*!< I2S work mode (must include TX and/or RX)*/
+        i2s_mode_t mode;                        /*!< I2S work mode (must include TX and/or RX, and MASTER xor SLAVE)*/
         int sample_rate;                        /*!< I2S sample rate (must be > 0)*/
         i2s_bits_per_sample_t bits_per_sample;  /*!< I2S bits per sample (16 or 24)*/
         i2s_channel_fmt_t channel_format;       /*!< I2S channel format */
-        i2s_comm_format_t communication_format; /*!< I2S communication format */
-        int dma_buf_count;                      /*!< I2S DMA Buffer Count */
-        int dma_buf_len;                        /*!< I2S DMA Buffer Length */
+        i2s_comm_format_t communication_format; /*!< I2S communication format (see i2s_comm_format_t) */
+        int dma_buf_count;                      /*!< I2S DMA Buffer Count (2..128) */
+        int dma_buf_len;                        /*!< I2S DMA Buffer Length in samples (8..1024) */
         bool tx_desc_auto_clear;                /*!< I2S auto clear tx descriptor if there is underflow condition */
     } i2s_config_t;
 
@@ -130,9 +153,8 @@ extern "C"
      * @brief I2S pin enable for i2s_set_pin
      *
      * NOTE: fields are `int` (not `bool`) to support the `1/-1` sentinel pattern
-     * used by other SDK drivers (e.g. ir_tx.c uses `1` to enable a pin and `-1`
-     * to skip it). i2s_set_pin uses a `> 0` check: positive enables the pin;
-     * 0 and -1 skip it.
+     * used by other SDK drivers. i2s_set_pin uses a `> 0` check: positive enables
+     * the pin; 0 and -1 skip it.
      */
     typedef struct
     {
@@ -170,6 +192,17 @@ extern "C"
     /**
      * @brief Install and start I2S driver.
      *
+     * The driver's control lock is held for the whole call, so concurrent
+     * control calls (i2s_start/i2s_stop/...) wait and then observe the final
+     * state.
+     *
+     * On failure the driver performs a best-effort cleanup. In the practically
+     * unreachable case that another task still holds a reference to the
+     * half-installed object when cleanup runs, the object is left alive in
+     * I2S_DRV_STOPPED instead of being freed under that caller; the install
+     * call still returns an error and the application MUST follow up with
+     * i2s_driver_uninstall() to release it.
+     *
      * @return
      *     - ESP_OK on success
      *     - ESP_ERR_INVALID_ARG on bad config
@@ -184,19 +217,42 @@ extern "C"
     /**
      * @brief Uninstall I2S driver.
      *
-     * NOTE:
-     * The driver no longer deletes the event queue internally.
-     * If a queue was created by the driver during install, it is detached but left
-     * valid. The application must call vQueueDelete() on the queue after it has
-     * stopped using it.
+     * Wakes and drains tasks blocked in i2s_write()/i2s_read(), waits for
+     * other in-flight API calls, then releases the DMA rings, the control
+     * lock and the idle event group.
+     *
+     * NOTE ON EVENT-QUEUE OWNERSHIP (memory-leak hazard):
+     * If a queue was created by the driver during install (i.e. the caller
+     * passed a non-NULL @c i2s_queue pointer), uninstall detaches it but
+     * leaves it valid and allocated, because deleting a queue that another
+     * task is blocked on is undefined behaviour in FreeRTOS. The application
+     * MUST call vQueueDelete() on that QueueHandle after it has stopped using
+     * it — otherwise the queue and its storage are leaked.
+     *
+     * @return
+     *     - ESP_OK on success
+     *     - ESP_ERR_INVALID_STATE if not installed
+     *     - ESP_ERR_TIMEOUT if readers/writers or other API calls did not
+     *       drain in time (driver left in its previous state)
      */
     esp_err_t i2s_driver_uninstall(i2s_port_t i2s_num);
 
     /**
      * @brief Write data to I2S DMA transmit buffer.
      *
-     * On timeout (ticks_to_wait expired before all @p size bytes could be queued),
-     * returns ESP_OK and *bytes_written < size. Always check *bytes_written.
+     * @p ticks_to_wait bounds each individual wait (for the writer lock and
+     * for every DMA buffer), not the whole call — same semantics as ESP-IDF.
+     * Pass portMAX_DELAY for no timeout. On timeout returns ESP_OK with
+     * *bytes_written < size. Always check *bytes_written.
+     *
+     * If the driver leaves RUNNING while the call is blocked (i2s_stop,
+     * i2s_set_clk, i2s_driver_uninstall from another task) the call returns
+     * promptly with ESP_OK and the bytes written so far.
+     *
+     * @return
+     *     - ESP_OK               Success (possibly partial — see above)
+     *     - ESP_ERR_INVALID_ARG  Parameter error / driver not configured for TX
+     *     - ESP_ERR_INVALID_STATE Driver not installed or not RUNNING
      */
     esp_err_t i2s_write(i2s_port_t i2s_num,
                         const void *src,
@@ -207,7 +263,7 @@ extern "C"
     /**
      * @brief Read data from I2S DMA receive buffer.
      *
-     * On timeout returns ESP_OK and *bytes_read < size. Always check *bytes_read.
+     * Same timeout / return semantics as i2s_write().
      */
     esp_err_t i2s_read(i2s_port_t i2s_num,
                        void *dest,
@@ -216,33 +272,59 @@ extern "C"
                        TickType_t ticks_to_wait);
 
     /**
-     * @brief Set sample rate used for I2S RX and TX.
+     * @brief Set sample rate used for I2S RX and TX (keeps bits and channels).
      */
     esp_err_t i2s_set_sample_rates(i2s_port_t i2s_num, uint32_t rate);
 
     /**
      * @brief Stop I2S driver.
+     *
+     * Drains active readers/writers first. Calling it on an already stopped
+     * driver is not an error.
+     *
+     * @return
+     *     - ESP_OK
+     *     - ESP_ERR_INVALID_STATE not installed
+     *     - ESP_ERR_TIMEOUT       readers/writers did not drain — driver left RUNNING
      */
     esp_err_t i2s_stop(i2s_port_t i2s_num);
 
     /**
      * @brief Start I2S driver.
+     *
+     * Calling it on an already running driver is a no-op (ESP_OK).
+     *
+     * @return
+     *     - ESP_OK
+     *     - ESP_ERR_INVALID_STATE not installed
      */
     esp_err_t i2s_start(i2s_port_t i2s_num);
 
     /**
      * @brief Zero the contents of the TX/RX DMA buffers.
      *
-     * If the driver was RUNNING, it is restarted after zeroing.
-     * If the driver was STOPPED, it remains STOPPED.
+     * Stops the DMA, zeroes every buffer, resets the queues. If the driver
+     * was RUNNING it is restarted afterwards; if it was STOPPED it stays so.
      */
     esp_err_t i2s_zero_dma_buffer(i2s_port_t i2s_num);
 
     /**
-     * @brief Set clock & bit width used for I2S RX and TX.
+     * @brief Set clock & bit width & channel count used for I2S RX and TX.
      *
      * If the driver was RUNNING before the call, it is restarted after applying
-     * the new clock/bit width. If it was STOPPED, it remains STOPPED.
+     * the new configuration. If it was STOPPED, it remains STOPPED.
+     *
+     * Channel count changes keep the channel side: stereo -> mono keeps
+     * left/right (ALL_LEFT -> ONLY_LEFT, everything else -> ONLY_RIGHT),
+     * mono -> stereo returns to the stereo format given at install
+     * (RIGHT_LEFT unless ALL_LEFT/ALL_RIGHT was requested).
+     *
+     * @return
+     *     - ESP_OK
+     *     - ESP_ERR_INVALID_ARG   bits not 16/24, ch not 1/2, rate == 0
+     *     - ESP_ERR_INVALID_STATE not installed
+     *     - ESP_ERR_NO_MEM        new DMA rings could not be allocated (old state kept)
+     *     - ESP_ERR_TIMEOUT       readers/writers did not drain (old state kept)
      */
     esp_err_t i2s_set_clk(i2s_port_t i2s_num,
                           uint32_t rate,
@@ -260,20 +342,25 @@ extern "C"
      * @brief Write data to I2S DMA transmit buffer while expanding the number
      *        of bits per sample. For example, expanding 16-bit PCM to 32-bit PCM.
      *
-     * @note For this ESP8266 driver, aim_bits must be 16 or 32 (not 24),
-     *       because the 24-bit DMA mode uses 32-bit left-justified words.
+     * The expansion is done in small chunks on the stack and passed to
+     * i2s_write() chunk by chunk — no heap allocation. Consequently a call is
+     * not atomic with respect to other writers.
+     *
+     * @note aim_bits must be 16 or 32 (not 24), because the 24-bit DMA mode
+     *       uses 32-bit left-justified words, and it must match the driver's
+     *       configured sample width (16-bit driver -> 16, 24-bit driver -> 32).
      *
      * @param i2s_num             I2S_NUM_0
      * @param src                 Source address to write from
-     * @param size                Size of data in bytes
+     * @param size                Size of data in bytes (multiple of src_bits/8)
      * @param src_bits            Source audio bit (8, 16 or 24)
      * @param aim_bits            Target bits (16 or 32, must be > src_bits)
-     * @param[out] bytes_written  Number of source bytes written
-     * @param ticks_to_wait       TX buffer wait timeout in RTOS ticks
+     * @param[out] bytes_written  Number of SOURCE bytes written
+     * @param ticks_to_wait       TX buffer wait timeout in RTOS ticks (per wait)
      * @return
-     *     - ESP_OK              Success
+     *     - ESP_OK              Success (possibly partial — check *bytes_written)
      *     - ESP_ERR_INVALID_ARG Parameter error
-     *     - ESP_ERR_NO_MEM      Out of memory
+     *     - ESP_ERR_INVALID_STATE Driver not installed or not RUNNING
      */
     esp_err_t i2s_write_expand(i2s_port_t i2s_num,
                                const void *src,

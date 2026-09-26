@@ -132,7 +132,22 @@ static void tcp_accept_task_fn(void *arg)
          * design (refuse + retry next iteration).
          * Tradeoff: a stuck peer blocks accept for 500ms instead of 100ms;
          * new client then gets refused (socket_close_safe + continue) -- the
-         * next accept loop iteration retries. */
+         * next accept loop iteration retries.
+         *
+         * B5 fix: a NEW client typically arrives exactly when the OLD
+         * connection is dead (server restarted / reconnected) and the TX
+         * task is stuck in send() on it for up to TCP_FRAME_SEND_DEADLINE_MS
+         * (2.5 s) holding s_client_mutex — far longer than the 500 ms above,
+         * so the reconnecting server used to be refused (and saw a RST).
+         * shutdown(SHUT_RDWR) on the old socket makes that send() return at
+         * once (tcp_stream_abort does exactly this, mutex-tolerant); the TX
+         * task then closes it and releases the mutex within a few ms. */
+        if (s_client_sock >= 0)
+        {
+            ESP_LOGI(TAG, "new client while old connection attached - aborting old send");
+            tcp_stream_abort();
+        }
+
         int old;
         if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(500)) == pdTRUE)
         {
@@ -291,7 +306,8 @@ esp_err_t tcp_stream_deinit(void)
     if (s_client_mutex)
     {
         /* Bound the wait: send() holds the mutex at most
-         * TCP_FRAME_SEND_DEADLINE_MS (2500ms). Add 500ms margin. */
+         * TCP_FRAME_SEND_DEADLINE_MS (menuconfig-configurable).
+         * Add 500ms margin. */
         if (xSemaphoreTake(s_client_mutex,
                            pdMS_TO_TICKS(TCP_FRAME_SEND_DEADLINE_MS + 500)) == pdTRUE)
         {
@@ -567,3 +583,4 @@ esp_err_t tcp_stream_send(const uint8_t *data, size_t len)
     xSemaphoreGive(s_client_mutex);
     return ESP_OK;
 }
+

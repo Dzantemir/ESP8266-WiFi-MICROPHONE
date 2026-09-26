@@ -92,6 +92,14 @@
 #define TCP_SEND_TIMEOUT_MS 2000
 #endif
 
+
+#ifdef CONFIG_STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
+#define STREAM_STOP_TIMEOUT_TCP_MS  CONFIG_STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
+#else
+/* Default: must be > TCP_SEND_TIMEOUT_MS (2000). */
+#define STREAM_STOP_TIMEOUT_TCP_MS  3000
+#endif
+
 /* FR-TCP (#1, #22) + F2-TCP (#2): max CONSECUTIVE EAGAIN/EWOULDBLOCK retries
  * in tcp_stream_send() AFTER the first EAGAIN. Total worst-case send() mutex
  * hold time = (TCP_EAGAIN_MAX_RETRIES + 1) * TCP_SEND_TIMEOUT_MS (the "+1"
@@ -110,8 +118,12 @@
  *
  * The cross-validation #error in board_config.h uses (RETRIES + 1) to match
  * the actual worst-case send() time (NOT just RETRIES * TIMEOUT). */
-#define TCP_EAGAIN_MAX_RETRIES      0   /* 0 = one send attempt (2s max), no EAGAIN retry */
-
+#ifdef CONFIG_STREAMER_TCP_EAGAIN_MAX_RETRIES
+#define TCP_EAGAIN_MAX_RETRIES      CONFIG_STREAMER_TCP_EAGAIN_MAX_RETRIES
+#else
+/* Fallback default: 0 = one send attempt (2s max), no EAGAIN retry. */
+#define TCP_EAGAIN_MAX_RETRIES      0
+#endif
 /* F3-A HIGH #1: total max wall-clock time to send one complete frame (sum of
  * all send() calls for the frame, including partial sends and EAGAIN retries).
  * The EAGAIN retry counter alone is insufficient — a slow-reader client that
@@ -119,10 +131,15 @@
  * can keep s_client_mutex held indefinitely via many short sends, each bounded
  * only by TCP_SEND_TIMEOUT_MS. This deadline bounds the WHOLE frame send.
  * Must be < STREAM_STOP_TIMEOUT_TCP_MS so stop_streaming() never force-deletes
- * the TX task while it still holds s_client_mutex (see cross-validation #error
- * in board_config.h). */
-#define TCP_FRAME_SEND_DEADLINE_MS   2500  /* total max time to send one frame;
-                                           * must be < STREAM_STOP_TIMEOUT_TCP_MS (3000) */
+ * the TX task while it still holds s_client_mutex, and > TCP_SEND_TIMEOUT_MS
+ * so one full send() window fits inside the deadline (see cross-validation
+ * #error / #warning checks in board_config.h). */
+#ifdef CONFIG_STREAMER_TCP_FRAME_SEND_DEADLINE_MS
+#define TCP_FRAME_SEND_DEADLINE_MS  CONFIG_STREAMER_TCP_FRAME_SEND_DEADLINE_MS
+#else
+/* Fallback default: 2500ms. Must stay < STREAM_STOP_TIMEOUT_TCP_MS (3000). */
+#define TCP_FRAME_SEND_DEADLINE_MS  2500
+#endif
 
 #ifdef CONFIG_STREAMER_TCP_ACCEPT_TASK_STACK
 #define TCP_ACCEPT_TASK_STACK CONFIG_STREAMER_TCP_ACCEPT_TASK_STACK
@@ -242,13 +259,6 @@
 #else
 /* Default: must be > UDP_SEND_TIMEOUT_MS (2000). */
 #define STREAM_STOP_TIMEOUT_UDP_MS  3000
-#endif
-
-#ifdef CONFIG_STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
-#define STREAM_STOP_TIMEOUT_TCP_MS  CONFIG_STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
-#else
-/* Default: must be > TCP_SEND_TIMEOUT_MS (2000). */
-#define STREAM_STOP_TIMEOUT_TCP_MS  3000
 #endif
 
 /* I2S DMA buffer dimensions are DERIVED from samples_per_frame at runtime

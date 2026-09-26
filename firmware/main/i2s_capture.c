@@ -19,7 +19,7 @@
  */
 
 /* ---- System / SDK includes ---- */
-#include <string.h>   /* memcpy for 16-bit swap/sign-extend (AUDIT-C3) */
+#include <string.h> /* memcpy for 16-bit swap/sign-extend (AUDIT-C3) */
 /* PRIu32 for portable uint32_t printf format (2-E LOW). */
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
@@ -30,19 +30,42 @@
 /* ---- Project includes ---- */
 #include "board_config.h"
 #include "i2s_capture.h"
-#include "config_mgr.h"  /* channel_format_to_count() */
+#include "config_mgr.h" /* channel_format_to_count() */
 #include "agc.h"
 
 /* ---- Named magic numbers ---- */
-#define I2S_MTU_BYTES               1400
-#define DMA_MIN_SAMPLES             128
-#define DMA_POOL_TARGET_MS          80      /* current target (was 256ms) */
-#define MAX_FRAME_MS                60
-#define MIN_FRAME_MS                5
-#define SAMPLE_MAX_16BIT            32767
-#define SAMPLE_MIN_16BIT           -32768
-#define SAMPLE_MAX_24BIT            8388607
-#define SAMPLE_MIN_24BIT           -8388608
+#define I2S_MTU_BYTES 1400
+#define DMA_MIN_SAMPLES 128
+/* B8 fix: receiver-side ADPCM limit, derived from the current PowerBASIC
+ * server (audio_thread.inc): bufSz = 4 * WAVE_BUF_SZ = 7680 bytes,
+ *   mono   : adpcmLen clipped to bufSz/4 = 1920 bytes -> 3840 samples
+ *   stereo : adpcmLen clipped to bufSz/8 =  960 bytes -> 1920 samples/channel
+ * The old hard-coded 960-sample cap dated from an earlier server (480-byte
+ * clip) and needlessly forced 20 ms frames at 48 kHz. The MTU bound below is
+ * tighter than this in every configuration, so it is a documented safety
+ * net rather than an active limit. */
+#define SERVER_ADPCM_MAX_BYTES_MONO 1920
+#define SERVER_ADPCM_MAX_BYTES_PER_CH_STEREO 960
+static inline int server_adpcm_max_samples(int channels)
+{
+    return (channels == 2) ? SERVER_ADPCM_MAX_BYTES_PER_CH_STEREO * 2
+                           : SERVER_ADPCM_MAX_BYTES_MONO * 2;
+}
+#define DMA_POOL_TARGET_MS 80 /* current target (was 256ms) */
+/* Upper bound for the chosen frame duration — menuconfig
+ * STREAMER_MAX_FRAME_MS (board_audio.h), default 60 = old behaviour.
+ * start_streaming() may pass a lower bound at runtime when the buffers for
+ * the chosen frame do not fit in DRAM (see the *_max() variants). */
+#define MAX_FRAME_MS AUDIO_MAX_FRAME_MS
+#define MIN_FRAME_MS I2S_CAP_MIN_FRAME_MS
+#define ABS_MAX_FRAME_MS 60
+#if (MAX_FRAME_MS < MIN_FRAME_MS) || (MAX_FRAME_MS > ABS_MAX_FRAME_MS)
+#error "STREAMER_MAX_FRAME_MS must be within 5..60"
+#endif
+#define SAMPLE_MAX_16BIT 32767
+#define SAMPLE_MIN_16BIT -32768
+#define SAMPLE_MAX_24BIT 8388607
+#define SAMPLE_MIN_24BIT -8388608
 
 static const char *TAG = "i2s_cap";
 #define I2S_PORT I2S_NUM_0
@@ -52,15 +75,27 @@ static int s_bits = 24;
 static int s_channels = 1;
 static uint32_t s_sample_rate = 16000;
 static uint32_t s_frame_ms = 20;
-static uint8_t s_gain = 32;        /* 0=bypass, 1..64 = multiplier */
+static uint8_t s_gain = 32; /* 0=bypass, 1..64 = multiplier */
 static uint8_t s_timing_sd_delay = 0;
 static uint8_t s_timing_ws_delay = 0;
 static uint8_t s_timing_bck_delay = 0;
 
 /* Preferred frame durations (ms), largest first. Shared by compute_frame_ms
  * and compute_frame_ms_rawtx — single source of truth. */
-static const uint32_t FRAME_MS_PREFERRED[] = {MAX_FRAME_MS, 50, 40, 30, 25, 20, 15, 10, MIN_FRAME_MS};
+/* Entries above the (compile-time or runtime) upper bound are skipped by
+ * both search loops. */
+static const uint32_t FRAME_MS_PREFERRED[] = {60, 50, 40, 30, 25, 20, 15, 10, MIN_FRAME_MS};
 #define FRAME_MS_PREFERRED_COUNT (sizeof(FRAME_MS_PREFERRED) / sizeof(FRAME_MS_PREFERRED[0]))
+
+/* Clamp a runtime upper bound to the legal range. */
+static uint32_t clamp_max_frame_ms(uint32_t max_frame_ms)
+{
+    if (max_frame_ms < (uint32_t)MIN_FRAME_MS)
+        return (uint32_t)MIN_FRAME_MS;
+    if (max_frame_ms > (uint32_t)ABS_MAX_FRAME_MS)
+        return (uint32_t)ABS_MAX_FRAME_MS;
+    return max_frame_ms;
+}
 
 /* ---- Frame duration computation ----
  *
@@ -82,9 +117,18 @@ static const uint32_t FRAME_MS_PREFERRED[] = {MAX_FRAME_MS, 50, 40, 30, 25, 20, 
 uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
                                       int codec_mode, int bits_per_sample)
 {
+    return i2s_capture_compute_frame_ms_max(sample_rate, channels, codec_mode,
+                                            bits_per_sample, (uint32_t)MAX_FRAME_MS);
+}
+
+uint32_t i2s_capture_compute_frame_ms_max(uint32_t sample_rate, int channels,
+                                          int codec_mode, int bits_per_sample,
+                                          uint32_t max_frame_ms)
+{
+    max_frame_ms = clamp_max_frame_ms(max_frame_ms);
 
     if (sample_rate == 0 || (channels != 1 && channels != 2))
-        return 20;
+        return (max_frame_ms < 20U) ? max_frame_ms : 20U;
 
     /* bytes per sample in the packet payload */
     int bps;
@@ -111,14 +155,11 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
         max_samples = ((I2S_MTU_BYTES - 16) - channels * 4) * 2 / channels;
         if (max_samples & 1)
             max_samples--; /* ADPCM needs even */
-        /* Server buffer limit: WAVE_BUF_SZ = 1920 bytes.
-         * ADPCM decode produces 4 bytes per input byte (2 samples x 2 bytes).
-         * Server clips adpcmLen to WAVE_BUF_SZ/4 = 480 bytes per channel.
-         * -> samples <= 480 * 2 = 960 (adpcmLen = samples/2 <= 480). Without
-         * this limit, large frames (e.g. 50ms@48kHz -> adpcmLen=1200) get
-         * truncated by the server -> 60% data loss -> distortion. */
-        if (max_samples > 960)
-            max_samples = 960;
+        /* Server buffer limit (B8 fix): see SERVER_ADPCM_MAX_BYTES_*. A frame
+         * larger than the receiver's decode buffer would be truncated there
+         * -> data loss -> distortion, so keep it as a hard cap. */
+        if (max_samples > server_adpcm_max_samples(channels))
+            max_samples = server_adpcm_max_samples(channels);
     }
     if (max_samples < DMA_MIN_SAMPLES)
         max_samples = DMA_MIN_SAMPLES; /* DMA minimum */
@@ -128,14 +169,14 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
      * than MTU; IP fragmentation is recoverable, DMA underrun is not). */
     {
         int mtu_max_samples = (codec_mode == 1 /* PCM */)
-            ? (I2S_MTU_BYTES - 16) / (channels * bps)
-            : (((I2S_MTU_BYTES - 16) - channels * 4) * 2 / channels);
-        if (mtu_max_samples > 960 && codec_mode != 1)
-            mtu_max_samples = 960;
+                                  ? (I2S_MTU_BYTES - 16) / (channels * bps)
+                                  : (((I2S_MTU_BYTES - 16) - channels * 4) * 2 / channels);
+        if (codec_mode != 1 && mtu_max_samples > server_adpcm_max_samples(channels))
+            mtu_max_samples = server_adpcm_max_samples(channels);
         if (mtu_max_samples < DMA_MIN_SAMPLES && max_samples > mtu_max_samples)
         {
             ESP_LOGW(TAG, "max_samples=%u exceeds MTU-derived max=%u "
-                     "(DMA min %d enforced; expect IP fragmentation)",
+                          "(DMA min %d enforced; expect IP fragmentation)",
                      (unsigned)max_samples, (unsigned)mtu_max_samples, DMA_MIN_SAMPLES);
         }
     }
@@ -144,6 +185,8 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
     for (int i = 0; i < (int)FRAME_MS_PREFERRED_COUNT; i++)
     {
         uint32_t ms = FRAME_MS_PREFERRED[i];
+        if (ms > max_frame_ms)
+            continue; /* upper bound: STREAMER_MAX_FRAME_MS or runtime (DRAM) */
         int samples = (int)(sample_rate * ms / 1000);
         if (samples < DMA_MIN_SAMPLES)
             continue; /* DMA minimum */
@@ -159,8 +202,8 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
      * doesn't fit, e.g. 48kHz stereo PCM-24bit where max_ms=4). Capped at
      * MAX_FRAME_MS. */
     int max_ms = max_samples * 1000 / (int)sample_rate;
-    if (max_ms > MAX_FRAME_MS)
-        max_ms = MAX_FRAME_MS;
+    if (max_ms > (int)max_frame_ms)
+        max_ms = (int)max_frame_ms;
     for (int ms = max_ms; ms >= 1; ms--)
     {
         int samples = (int)(sample_rate * ms / 1000);
@@ -173,7 +216,7 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
             continue;
         return (uint32_t)ms;
     }
-    return 20;
+    return (max_frame_ms < 20U) ? max_frame_ms : 20U;
 }
 
 /* RawTX air-time constrained variant (2-E HIGH #14). The base function
@@ -185,17 +228,29 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
  * enforces MTU/DMA-min/even-sample so the _rawtx choice never violates
  * them (4-C MEDIUM #11). */
 uint32_t i2s_capture_compute_frame_ms_rawtx(uint32_t sample_rate, int channels,
-                                             int codec_mode, int bits_per_sample)
+                                            int codec_mode, int bits_per_sample)
 {
+    return i2s_capture_compute_frame_ms_rawtx_max(sample_rate, channels, codec_mode,
+                                                  bits_per_sample, (uint32_t)MAX_FRAME_MS);
+}
+
+uint32_t i2s_capture_compute_frame_ms_rawtx_max(uint32_t sample_rate, int channels,
+                                                int codec_mode, int bits_per_sample,
+                                                uint32_t max_frame_ms)
+{
+    max_frame_ms = clamp_max_frame_ms(max_frame_ms);
     /* Audio bitrate in bps. ADPCM = 4 bits/sample, PCM = bits_per_sample. */
     uint32_t bits_per_sample_eff = (codec_mode == CODEC_MODE_PCM)
-        ? (uint32_t)bits_per_sample : 4;
+                                       ? (uint32_t)bits_per_sample
+                                       : 4;
     uint32_t audio_bitrate = sample_rate * bits_per_sample_eff * (uint32_t)channels;
 
     /* Use file-scope FRAME_MS_PREFERRED[] (single source of truth). */
     for (int i = 0; i < (int)FRAME_MS_PREFERRED_COUNT; i++)
     {
         uint32_t ms = FRAME_MS_PREFERRED[i];
+        if (ms > max_frame_ms)
+            continue; /* upper bound: STREAMER_MAX_FRAME_MS or runtime (DRAM) */
 
         /* Air-time constraint: audio_bitrate (bps) -> kbps + per-packet
          * CSMA/CA + driver overhead in ms. */
@@ -203,14 +258,14 @@ uint32_t i2s_capture_compute_frame_ms_rawtx(uint32_t sample_rate, int channels,
         uint32_t overhead_ms = 3000U / ms;
         if (kbps + overhead_ms > 950U)
         {
-            continue;  /* exceeds 95% air-time budget */
+            continue; /* exceeds 95% air-time budget */
         }
 
         /* Mirror base function's MTU/DMA-min/even-sample guards. */
         uint32_t samples = sample_rate * ms / 1000U;
-        /* Server buffer limit: WAVE_BUF_SZ = 1920 bytes.
-         * ADPCM: server clips to 480 bytes/channel = 960 samples max. */
-        if (codec_mode != CODEC_MODE_PCM && samples > 960U)
+        /* Server buffer limit (B8 fix): see SERVER_ADPCM_MAX_BYTES_*. */
+        if (codec_mode != CODEC_MODE_PCM &&
+            samples > (uint32_t)server_adpcm_max_samples(channels))
             continue;
         if (samples < (uint32_t)DMA_MIN_SAMPLES)
         {
@@ -220,7 +275,7 @@ uint32_t i2s_capture_compute_frame_ms_rawtx(uint32_t sample_rate, int channels,
         {
             continue;
         }
-        uint32_t pkt_size = PKT_HDR_SIZE;  /* 16 bytes */
+        uint32_t pkt_size = PKT_HDR_SIZE; /* 16 bytes */
         if (codec_mode != CODEC_MODE_PCM)
         {
             pkt_size += (uint32_t)channels * (DVI4_HEADER_SIZE + samples / 2U);
@@ -252,7 +307,8 @@ uint32_t i2s_capture_compute_frame_ms_rawtx(uint32_t sample_rate, int channels,
     ESP_LOGW(TAG, "RawTX: audio_bitrate=%" PRIu32 " bps exceeds air-time budget, "
                   "falling back to DMA/MTU-safe frame_ms (expect packet drops)",
              audio_bitrate);
-    return i2s_capture_compute_frame_ms(sample_rate, channels, codec_mode, bits_per_sample);
+    return i2s_capture_compute_frame_ms_max(sample_rate, channels, codec_mode,
+                                            bits_per_sample, max_frame_ms);
 }
 
 /* Forward decl — defined after i2s_capture_init (called from it). */
@@ -296,8 +352,8 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
     s_sample_rate = sample_rate;
     s_frame_ms = frame_ms;
     s_gain = gain;
-    s_timing_sd_delay  = timing_sd_delay;
-    s_timing_ws_delay  = timing_ws_delay;
+    s_timing_sd_delay = timing_sd_delay;
+    s_timing_ws_delay = timing_ws_delay;
     s_timing_bck_delay = timing_bck_delay;
 
     /* Initialize AGC (loads preset parameters + resets envelope/gain state).
@@ -330,10 +386,9 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
      * Matches the driver's actual sample_size (previously '* 4' was wrong for
      * 24-bit stereo — wasted 7 KB of heap -> lwIP send() EAGAIN). */
     uint32_t bytes_per_dma_word =
-        (s_bits == 24 && s_channels == 2) ? 8U :
-        (s_bits == 24 && s_channels == 1) ? 4U :
-        (s_bits == 16 && s_channels == 2) ? 4U :
-        2U;  /* 16-bit mono */
+        (s_bits == 24 && s_channels == 2) ? 8U : (s_bits == 24 && s_channels == 1) ? 4U
+                                             : (s_bits == 16 && s_channels == 2)   ? 4U
+                                                                                   : 2U; /* 16-bit mono */
 
     int dma_buf_count = (int)((uint32_t)DMA_POOL_TARGET_MS * sample_rate / (1000U * (uint32_t)dma_buf_len)) + 4;
     if (dma_buf_count < 6)
@@ -418,7 +473,7 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
          * i2s_driver_uninstall is needed here. Log the leftover state so the
          * user knows a reboot may be needed if re-init fails. */
         ESP_LOGW(TAG, "GPIO matrix config from i2s_set_pin remains after "
-                 "driver_install failure - reboot if re-init fails");
+                      "driver_install failure - reboot if re-init fails");
         return err;
     }
 
@@ -476,8 +531,8 @@ static void apply_timing(int sd_delay, int ws_delay, int bck_delay)
         ESP_LOGW(TAG, "apply_timing ignored - not initialized");
         return;
     }
-    I2S0.timing.rx_sd_in_delay  = sd_delay  & 0x3;
-    I2S0.timing.rx_ws_in_delay  = ws_delay  & 0x3;
+    I2S0.timing.rx_sd_in_delay = sd_delay & 0x3;
+    I2S0.timing.rx_ws_in_delay = ws_delay & 0x3;
     I2S0.timing.rx_bck_in_delay = bck_delay & 0x3;
     /* Memory barrier — гарантируем, что запись завершится до возврата. */
     asm volatile("" ::: "memory");
@@ -493,7 +548,8 @@ esp_err_t i2s_capture_deinit(void)
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "i2s_driver_uninstall: %s - clearing s_initialized anyway "
-                 "(caller should reboot if re-init fails)", esp_err_to_name(err));
+                      "(caller should reboot if re-init fails)",
+                 esp_err_to_name(err));
         /* Clear s_initialized even on uninstall failure (GROK-7): otherwise
          * the next init sees s_initialized==true and returns ESP_OK without
          * re-installing, leaving the device stuck half-torn-down. */
@@ -666,3 +722,4 @@ esp_err_t i2s_capture_read(int32_t *buf, int buf_len, int *samples_read)
 }
 
 int i2s_capture_get_bits(void) { return s_bits; }
+

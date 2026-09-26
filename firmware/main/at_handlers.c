@@ -638,6 +638,15 @@ static int parse_wifi_args(const char *args, char *ssid, size_t ssid_sz,
             return -1; /* unterminated quote */
         p++;           /* skip closing quote */
         ssid[i] = '\0';
+        /* B6 fix: tolerate whitespace between the closing quote and the
+         * comma. Previously `AT+WIFI="ssid" ,"pwd"` stopped here with
+         * *p == ' ' and fell through to "no comma -> open network", silently
+         * discarding the password. Anything else than ',' or end-of-string
+         * after the quoted SSID is now a syntax error. */
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p != '\0' && *p != ',')
+            return -1;
     }
     else
     {
@@ -1427,8 +1436,8 @@ static void cmd_status_impl(void)
     svc_port_status_t st;
     svc_port_get_status(&st);
 
-    //extern void mxr_dump(void);
-    //mxr_dump();
+    extern void mxr_dump(void);
+    mxr_dump();
 
     at_send_data("+STATUS:firmware=" FIRMWARE_VERSION "\r\n");
     at_send_data("+STATUS:wifi_ssid=\"%s\"\r\n", cfg.wifi_ssid);
@@ -1665,3 +1674,4 @@ static void cmd_log_query(void)
     at_send_data("+LOG:%s\r\n", s_logs_muted ? "0 (muted)" : "1 (enabled)");
     at_send_ok();
 }
+

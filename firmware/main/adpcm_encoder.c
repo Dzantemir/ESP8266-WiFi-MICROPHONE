@@ -16,6 +16,7 @@
 #include <stdint.h>   /* GROK-G11-21: explicit, for int16_t/uint8_t/int32_t */
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h" /* B2 fix: encoder state must be in DRAM */
 
 /* ---- Project includes ---- */
 #include "adpcm_encoder.h"
@@ -124,7 +125,12 @@ encode_sample(adpcm_enc_state_t *s, int16_t sample)
 
 adpcm_enc_state_t *adpcm_enc_create(void)
 {
-    adpcm_enc_state_t *s = calloc(1, sizeof(adpcm_enc_state_t));
+    /* B2 fix: the state (int16 predictor + uint8 index) is read and written
+     * with 16/8-bit accesses TWICE PER SAMPLE. calloc() = MALLOC_CAP_32BIT can
+     * place this 4-byte block in IRAM (mxr size class 4..127 B, IRAM-first),
+     * where every such access traps into the LoadStoreError handler
+     * (~150-200 cycles) — ~100k traps/s at 48 kHz. Force DRAM. */
+    adpcm_enc_state_t *s = heap_caps_calloc(1, sizeof(adpcm_enc_state_t), MALLOC_CAP_8BIT);
     if (!s)
     {
         ESP_LOGE(TAG, "Failed to allocate encoder state");
@@ -140,7 +146,7 @@ void adpcm_enc_destroy(adpcm_enc_state_t *enc)
 {
     if (enc)
     {
-        free(enc);
+        heap_caps_free(enc);
     }
 }
 
@@ -191,3 +197,4 @@ IRAM_ATTR __attribute__((optimize("O2"))) esp_err_t adpcm_enc_process(adpcm_enc_
     *written = required;
     return ESP_OK;
 }
+

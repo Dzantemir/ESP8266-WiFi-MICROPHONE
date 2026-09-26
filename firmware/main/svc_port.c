@@ -938,7 +938,10 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
 
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SVC_RECONFIGURE_STOP_TIMEOUT_MS);
         bool stopped = false;
-        while (xTaskGetTickCount() < deadline)
+        /* B7 fix: wrap-safe tick comparison (same idiom as teardown_pipeline);
+         * `now < deadline` breaks out immediately when the tick counter wraps
+         * while the deadline was computed just before the wrap. */
+        while ((int32_t)(deadline - xTaskGetTickCount()) > 0)
         {
             /* FIX (TOCTOU-1): recvfrom под мьютексом. MSG_DONTWAIT гарантирует
              * неблокирующий возврат, поэтому мьютекс удерживается микросекунды.
@@ -1533,3 +1536,4 @@ static esp_err_t svc_port_reinit_socket_impl(void)
     }
     return ESP_OK;
 }
+

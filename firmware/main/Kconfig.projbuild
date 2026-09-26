@@ -402,6 +402,59 @@ menu "ADPCM Streamer Configuration"
                 Lowered from 30000 to 15000 to shrink the DHCP-wedge window
                 (long backoff cycles increase the chance of lwIP DHCP client wedging).
 
+        choice STREAMER_WIFI_PS_MODE_CHOICE
+            prompt "WiFi power-save mode (esp_wifi_set_ps)"
+            default STREAMER_WIFI_PS_MAX_MODEM
+            help
+                Modem power-save mode applied at WIFI_EVENT_STA_START (both the
+                station and the Raw 802.11 TX radio setup).
+
+                NONE      - radio always on. Lowest latency / jitter, highest
+                            current (~70 mA). Best for a mains-powered streamer.
+                MIN_MODEM - sleep between DTIM beacons (wakes every beacon,
+                            DTIM=1). Good compromise for battery operation.
+                MAX_MODEM - sleep according to the AP's DTIM period. Lowest
+                            current, but RX/TX are bunched around DTIM wake-ups,
+                            which shows up as packet-arrival jitter on the
+                            server (buffered by its jitter buffer).
+
+                The previous firmware hard-coded MAX_MODEM; it stays the default
+                so upgrading does not change power consumption.
+
+            config STREAMER_WIFI_PS_NONE
+                bool "NONE (always on, lowest jitter)"
+            config STREAMER_WIFI_PS_MIN_MODEM
+                bool "MIN_MODEM (wake every beacon)"
+            config STREAMER_WIFI_PS_MAX_MODEM
+                bool "MAX_MODEM (wake per DTIM, lowest power)"
+        endchoice
+
+        config STREAMER_WIFI_PS_MODE
+            int
+            default 0 if STREAMER_WIFI_PS_NONE
+            default 1 if STREAMER_WIFI_PS_MIN_MODEM
+            default 2 if STREAMER_WIFI_PS_MAX_MODEM
+            default 2
+
+        config STREAMER_WIFI_DHCP_FALLBACK_MS
+            int "Static IP fallback after DHCP silence (ms, 0 = disabled)"
+            range 0 60000
+            default 8000
+            help
+                After (re)association the device always waits for DHCP first.
+                If no IP_EVENT_STA_GOT_IP arrives within this time and the
+                previous lease was obtained from the SAME access point (BSSID),
+                the last known IP/mask/gateway is applied statically so that
+                streaming can continue when the DHCP server is down.
+
+                While running on the static fallback the device retries DHCP
+                every WIFI_STATIC_REFRESH_MS (10 min, board_wifi.h) when it is
+                not streaming, so the lease is eventually renewed.
+
+                0 disables the fallback completely: DHCP only. The old
+                behaviour (apply the cached IP immediately, DHCP stopped
+                forever, even on a different network) is gone.
+
     endmenu
 
     # ===================================================================
@@ -651,6 +704,47 @@ menu "ADPCM Streamer Configuration"
             range 500 10000
             depends on STREAMER_TCP_SEND_TIMEOUT_MS_ENABLED
 
+        config STREAMER_TCP_EAGAIN_MAX_RETRIES
+            int "TCP EAGAIN retries per frame (0 = one send attempt)"
+            range 0 5
+            default 0
+            help
+                Max consecutive EAGAIN/EWOULDBLOCK retries in
+                tcp_stream_send() after the first send attempt. The
+                worst-case client-mutex hold from the EAGAIN path is
+                (RETRIES + 1) x TCP socket send timeout; the build
+                fails (#error in board_config.h) if that exceeds the
+                TCP stream stop timeout.
+
+                0 = exactly one send attempt, no EAGAIN retry (tuned
+                default). Retries beyond the whole-frame send deadline
+                never execute before the deadline closes the client
+                (build emits #warning) - raise the deadline as well if
+                you raise this.
+
+        config STREAMER_TCP_FRAME_SEND_DEADLINE_MS
+            int "TCP whole-frame send deadline (ms)"
+            range 500 15000
+            default 2500
+            help
+                Total wall-clock budget to push ONE complete frame:
+                the sum of all send() calls for the frame, including
+                partial sends and EAGAIN retries. Bounds how long a
+                slow-reader client can keep the TCP client mutex held;
+                on expiry the client connection is closed.
+
+                Constraints (enforced by #error/#warning in
+                board_config.h at build time):
+                - must be > TCP socket send timeout (one full send()
+                  window has to fit inside the deadline);
+                - must be < TCP stream stop timeout (so stop_streaming()
+                  never force-deletes the TX task mid-send);
+                - EAGAIN retries that cannot fit inside the deadline
+                  trigger a #warning (wasted retry budget).
+
+                Note: tcp_stream_deinit()/tcp_stream_close_client()
+                wait for the TCP client mutex for this value + 500 ms.
+
         config STREAMER_TCP_NODELAY_ENABLED
             bool "Enable TCP_NODELAY (disable Nagle algorithm)"
             default y
@@ -693,7 +787,7 @@ menu "ADPCM Streamer Configuration"
                 Total detection time ≈ keepidle + keepcnt × keepintvl (default: 19 s).
 
         config STREAMER_TCP_LINGER_ENABLED
-            bool "Enable SO_LINGER=0 on client sockets (RST close, skip TIME_WAIT)"
+            bool "Enable TCP SO_LINGER=0 on client sockets (RST close, skip TIME_WAIT)"
             default y
             help
                 Forces RST close instead of FIN, skipping TIME_WAIT entirely.
@@ -765,6 +859,45 @@ menu "ADPCM Streamer Configuration"
             depends on STREAMER_SUPERVISOR_ENABLED
             help
                 How often the supervisor runs its checks. 2s gives fast detection.
+
+    endmenu
+
+    # ===================================================================
+    #  Fine tuning (advanced)
+    # ===================================================================
+
+    menu "Fine tuning (advanced)"
+
+        config STREAMER_MAX_FRAME_MS
+            int "Maximum frame duration (ms, auto-reduced if DRAM is short)"
+            range 5 60
+            default 20
+            help
+                Upper bound for the audio frame duration, i.e. YOUR choice of
+                the latency / overhead trade-off. It is a limit, not a target:
+                at stream start the firmware picks the LARGEST value from
+                {60,50,40,30,25,20,15,10,5} ms that is <= this limit AND
+                satisfies the UDP MTU (1400 B), the DMA minimum, the ADPCM
+                even-sample rule and (RawTX) the air-time budget. If the
+                buffers for that frame cannot be allocated in DRAM, it steps
+                down automatically and logs "Frame duration reduced to N ms".
+
+                The automation only knows whether a frame FITS; what it
+                cannot decide is what you want:
+                  - latency: a frame is buffered completely before it is
+                    sent (plus the pool, plus the receiver's jitter buffer);
+                    50 ms frames add ~30 ms end-to-end over 20 ms and lose
+                    2.5x more audio per dropped packet;
+                  - headroom: the picker stops as soon as two packet pbufs
+                    still fit, so a lower limit is also how you keep spare
+                    DRAM for DHCP renew, the AT console, WiFi retries;
+                  - predictability: with a limit the frame does not depend
+                    on the heap state at stream start.
+
+                Default 20 = the proven 48 kHz configuration, no retries at
+                start. Raise it (e.g. 60) for 8-16 kHz ADPCM if you prefer
+                fewer, larger packets over latency. Note that PCM at high
+                rates is bounded by the MTU anyway (48 kHz/24-bit PCM = 5 ms).
 
     endmenu
 

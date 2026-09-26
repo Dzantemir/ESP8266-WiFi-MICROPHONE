@@ -347,8 +347,19 @@ void app_main(void)
         {
             esp_err_t start_err = start_streaming();
             /* FIX (B10): see FIXES.md */
-            if (start_err != ESP_OK && stream_mode_ops()->auto_start &&
-                auto_start_attempts < AUTO_START_MAX_ATTEMPTS)
+            if (start_err == ESP_ERR_INVALID_STATE && streaming_is_active())
+            {
+                /* Duplicate START_REQ: the server sends CONFIGURE three times
+                 * 200 ms apart and the 2nd/3rd may arrive while the first
+                 * start_streaming() is still running (I2S init, DMA flush,
+                 * frame-size retries) — svc_port then re-arms START_REQ.
+                 * The stream is up; nothing to do. Previously logged as
+                 * "Stream start failed: ESP_ERR_INVALID_STATE". */
+                ESP_LOGI(TAG, "Start request while already streaming - ignored");
+                auto_start_attempts = 0;
+            }
+            else if (start_err != ESP_OK && stream_mode_ops()->auto_start &&
+                     auto_start_attempts < AUTO_START_MAX_ATTEMPTS)
             {
                 auto_start_attempts++;
                 uint32_t delay = auto_start_backoff_ms[auto_start_attempts - 1];
@@ -376,3 +387,4 @@ void app_main(void)
         }
     }
 }
+

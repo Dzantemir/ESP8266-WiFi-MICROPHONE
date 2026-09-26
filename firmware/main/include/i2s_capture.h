@@ -77,6 +77,22 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 uint32_t i2s_capture_compute_frame_ms_rawtx(uint32_t sample_rate, int channels,
                                              int codec_mode, int bits_per_sample);
 
+/* Smallest frame duration the picker will ever return / accept. */
+#define I2S_CAP_MIN_FRAME_MS 5
+
+/* Same two functions with an explicit upper bound for the frame duration
+ * (clamped to 5..60 ms). The plain variants use the compile-time bound
+ * STREAMER_MAX_FRAME_MS. start_streaming() uses these to step down when the
+ * DRAM needed for the chosen frame (pools + I2S DMA + task buffers) is not
+ * available: 60 ms @ 48 kHz needs ~37 KB, more than an ESP8266 has left next
+ * to WiFi/lwIP. */
+uint32_t i2s_capture_compute_frame_ms_max(uint32_t sample_rate, int channels,
+                                          int codec_mode, int bits_per_sample,
+                                          uint32_t max_frame_ms);
+uint32_t i2s_capture_compute_frame_ms_rawtx_max(uint32_t sample_rate, int channels,
+                                                int codec_mode, int bits_per_sample,
+                                                uint32_t max_frame_ms);
+
 /* Initialize I2S capture with the given parameters.
  * DMA buffer dimensions are derived from samples_per_frame:
  *   dma_buf_len  = samples_per_frame / 4  (4 events per PCM frame)
@@ -132,3 +148,4 @@ esp_err_t i2s_capture_read(int32_t *buf, int buf_len, int *samples_read);
 int  i2s_capture_get_bits(void);
 
 #endif /* I2S_CAPTURE_H */
+

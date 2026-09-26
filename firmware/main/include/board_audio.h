@@ -218,7 +218,31 @@ extern const agc_preset_t AGC_PRESETS[AGC_MODE_COUNT];
 #define RAWTX_CHANNEL_DEFAULT 1
 #endif
 
+/* ====================================================================
+ *  Fine tuning (menuconfig -> "Fine tuning (advanced)")
+ * ==================================================================== */
+
+/* Upper bound for the runtime frame duration picked by
+ * i2s_capture_compute_frame_ms() (largest of {60,50,40,30,25,20,15,10,5} ms
+ * that is <= this and fits MTU/DMA/ADPCM/air-time). If the buffers for that
+ * frame cannot be allocated in DRAM, start_streaming() automatically steps
+ * down to the next smaller value (with a warning). It is a latency /
+ * overhead limit chosen by the user, not a target; default 20 ms. */
+#ifdef CONFIG_STREAMER_MAX_FRAME_MS
+#define AUDIO_MAX_FRAME_MS CONFIG_STREAMER_MAX_FRAME_MS
+#else
+#define AUDIO_MAX_FRAME_MS 20
+#endif
+
+/* Audio pipeline buffers (PCM/ADPCM pools, I2S read buffer, TX packet,
+ * de-interleave buffers, ADPCM encoder state) are ALWAYS allocated with
+ * heap_caps_malloc(MALLOC_CAP_8BIT), i.e. in DRAM — not configurable.
+ * 8/16-bit accesses to IRAM are emulated by the LoadStoreError handler at
+ * ~150-200 cycles each; with an IRAM-first heap policy that silently cost
+ * 15-25% CPU at 48 kHz. See audio_buf_alloc() in pipeline.c. */
+
 /* samples_per_frame and adpcm_frame_bytes are computed at runtime in
  * start_streaming() from frame_ms — no compile-time constants. */
 
 #endif /* BOARD_AUDIO_H */
+

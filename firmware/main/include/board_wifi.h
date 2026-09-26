@@ -82,6 +82,32 @@
 #define WIFI_RECONNECT_BACKOFF_MAX_MS  15000
 #endif
 
+/* WiFi modem power-save mode (esp_wifi_set_ps): 0 = NONE, 1 = MIN_MODEM,
+ * 2 = MAX_MODEM. menuconfig: STREAMER_WIFI_PS_MODE. Default keeps the
+ * historical MAX_MODEM. NONE gives the lowest packet jitter. */
+#define WIFI_PS_MODE_NONE       0
+#define WIFI_PS_MODE_MIN_MODEM  1
+#define WIFI_PS_MODE_MAX_MODEM  2
+#ifdef CONFIG_STREAMER_WIFI_PS_MODE
+#define WIFI_PS_MODE_CFG        CONFIG_STREAMER_WIFI_PS_MODE
+#else
+#define WIFI_PS_MODE_CFG        WIFI_PS_MODE_MAX_MODEM
+#endif
+
+/* Static-IP fallback (B1 fix). After association the device waits for DHCP;
+ * only if GOT_IP does not arrive within WIFI_DHCP_FALLBACK_MS and the cached
+ * lease came from the same BSSID is the last IP applied statically.
+ * 0 = never use the cache (DHCP only). */
+#ifdef CONFIG_STREAMER_WIFI_DHCP_FALLBACK_MS
+#define WIFI_DHCP_FALLBACK_MS   CONFIG_STREAMER_WIFI_DHCP_FALLBACK_MS
+#else
+#define WIFI_DHCP_FALLBACK_MS   8000
+#endif
+
+/* While running on the static fallback, retry DHCP this often (only when
+ * not streaming) so the lease gets renewed instead of going stale forever. */
+#define WIFI_STATIC_REFRESH_MS  (10U * 60U * 1000U)
+
 /* Raw 802.11 TX mode: max wait for WIFI_EVENT_STA_START after esp_wifi_start()
  * before giving up. esp_wifi_start() is async; we block on the STA_START event
  * (posted once the radio is calibrated) so the first esp_wifi_80211_tx() call
@@ -89,3 +115,4 @@
 #define WIFI_RAW_START_TIMEOUT_MS  3000
 
 #endif /* BOARD_WIFI_H */
+

@@ -48,6 +48,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_system.h"
+#include "esp_heap_caps.h" /* B2 fix: MALLOC_CAP_8BIT audio buffers */
 #include "esp_log.h"
 
 /* ---- Project includes ---- */
@@ -113,6 +114,19 @@ static adpcm_enc_state_t *adpcm_enc[2] = {NULL, NULL};
 uint8_t s_channels = AUDIO_CHANNELS; /* extern in pipeline_internal.h */
 static uint32_t s_sample_rate = 0;
 static int s_samples_per_frame = 0;
+
+/* B4 fix: exact frame timestamp. s_frame_ms is an integer approximation of
+ * the frame duration (e.g. 216 samples @ 11025 Hz = 19.59 ms -> 20), so
+ * `frame_count * s_frame_ms` drifted by up to ~30 ms per second of stream.
+ * Derive the timestamp from the exact sample count instead; wraps at 2^32 ms
+ * (~49.7 days, RFC 3550 semantics, see the notes at the call sites). */
+static inline uint32_t pipeline_frame_timestamp_ms(uint32_t frame_count)
+{
+    if (s_sample_rate == 0)
+        return 0;
+    return (uint32_t)(((uint64_t)frame_count * (uint64_t)s_samples_per_frame * 1000ULL) /
+                      (uint64_t)s_sample_rate);
+}
 static int s_adpcm_frame_bytes = 0;
 static uint32_t s_audio_bitrate = 0;
 static uint8_t s_sample_rate_enum = 0;
@@ -150,6 +164,126 @@ bool s_frame_ms_known = false; /* extern */
 
 /* ---- Helpers ---- */
 
+/* B2 fix: all audio pipeline buffers go through these two helpers and are
+ * ALWAYS allocated with MALLOC_CAP_8BIT (= DRAM).
+ *
+ * They are read/written as int16_t / uint8_t (dither output, ADPCM encoder
+ * input, packet assembly). ESP8266 IRAM only supports 32-bit accesses; an
+ * 8/16-bit access is completed by the LoadStoreError exception handler at
+ * ~150-200 cycles each. Plain malloc() is MALLOC_CAP_32BIT and with an
+ * IRAM-first heap policy (mxr_malloc IRAM_FIRST; stock SDK: IRAM region
+ * listed first) the pools DID land in IRAM (mxr_dump: iram_fb 3 alloc
+ * 1 -> 10 at stream start) — ~96k emulated accesses/s at 48 kHz.
+ * MALLOC_CAP_8BIT is the allocator-independent contract for byte-accessed
+ * memory, so this is not configurable. */
+static inline void *audio_buf_alloc(size_t size)
+{
+    return heap_caps_malloc(size, MALLOC_CAP_8BIT);
+}
+
+static inline void audio_buf_free(void *p)
+{
+    heap_caps_free(p);
+}
+
+/* Buffers that are touched by the CPU with 32-bit accesses ONLY may live in
+ * IRAM: MALLOC_CAP_32BIT = "IRAM if the allocator has some, DRAM otherwise"
+ * (stock SDK heap and mxr IRAM_FIRST prefer IRAM; mxr DRAM_FIRST uses IRAM
+ * once DRAM is exhausted). Every such buffer relieves the DRAM budget that
+ * limits the frame duration (see start_streaming). Qualifying today:
+ *   - s_raw_buf: written by i2s_read()/memcpy in 4-byte-aligned chunks
+ *     (samples_per_frame is aligned to 8/4 samples for exactly this reason),
+ *     unpacked with 4-byte memcpy()s (= l32i/s32i) and read as int32 by
+ *     AGC/gain/dither;
+ *   - PCM 24-bit frames (int32 samples, read word-wise by pcm_task_fn).
+ * The SLC DMA ring itself can NOT go there: the SLC is an AHB master that
+ * only reaches DRAM (heap caps: IRAM has no MALLOC_CAP_DMA) and its 20-bit
+ * link address must point into 0x3FF00000..0x3FFFFFFF.
+ * NEVER use this for anything accessed as uint8_t/int16_t. */
+/* MxR placement hint (mxr_malloc.h): "try IRAM first even under DRAM_FIRST".
+ * Defined locally so this file does not depend on the allocator headers;
+ * must match MXR_CAP_PREFER_IRAM. Only used when MxR is linked (weak symbol
+ * check below) — the stock SDK heap would reject the unknown bit. */
+#define PIPELINE_MXR_CAP_PREFER_IRAM (1u << 20)
+size_t mxr_get_free_size_caps(uint32_t caps) __attribute__((weak));
+
+static inline void *audio_buf_alloc32(size_t size)
+{
+    void *p = NULL;
+    if (mxr_get_free_size_caps) /* MxR linked -> hint understood */
+        p = heap_caps_malloc(size, MALLOC_CAP_32BIT | PIPELINE_MXR_CAP_PREFER_IRAM);
+    if (!p)
+        p = heap_caps_malloc(size, MALLOC_CAP_32BIT);
+    return p;
+}
+
+/* ---- DRAM sanity probe -----------------------------------------------------
+ * Everything above lives in DRAM now, so a large frame can exhaust it while
+ * the total heap (esp_get_free_heap_size = DRAM + IRAM) still looks fine.
+ * The frame duration is chosen by REAL allocations (start_streaming steps
+ * down when something does not fit); the only additional condition is that
+ * the network stack must still be able to build a packet: lwIP allocates a
+ * pbuf of (payload + ~64 B headers) for every sendto(). We require room for
+ * two of them — not a reserve, just "do not start a stream that cannot send".
+ *
+ * mxr_malloc (if linked) knows DRAM-only figures; its symbols are referenced
+ * weakly so the file also builds with the stock SDK heap. NOTE: with mxr in
+ * wrap mode and MXR_WRAP_HEAP_QUERY=n the SDK's heap_caps_get_free_size()
+ * walks regions that were never initialised (heap_caps_init is wrapped) and
+ * returns 0 — hence the mxr API first and 0 = "unknown, cannot judge". */
+size_t mxr_get_largest_free_block_caps(uint32_t caps) __attribute__((weak));
+
+static size_t dram_largest_free_block(void)
+{
+    if (mxr_get_largest_free_block_caps)
+        return mxr_get_largest_free_block_caps(MALLOC_CAP_8BIT);
+    if (mxr_get_free_size_caps)
+        return mxr_get_free_size_caps(MALLOC_CAP_8BIT);
+    return heap_caps_get_free_size(MALLOC_CAP_8BIT); /* stock SDK heap */
+}
+
+#define PIPELINE_PBUF_OVERHEAD 64 /* pbuf struct + ETH/IP/UDP headers */
+
+static bool pipeline_dram_can_send(void)
+{
+    size_t largest = dram_largest_free_block();
+    size_t need = 2U * ((size_t)PKT_HDR_SIZE + (size_t)s_pkt_data_len + PIPELINE_PBUF_OVERHEAD);
+
+    if (largest == 0)
+        return true; /* unknown allocator */
+
+    if (largest < need)
+    {
+        ESP_LOGW(TAG, "largest free DRAM block %u B < %u B (two packet pbufs) - "
+                      "the stream could not send",
+                 (unsigned)largest, (unsigned)need);
+        return false;
+    }
+    return true;
+}
+
+/* ---- Task buffers ---------------------------------------------------------
+ * Allocated up front by pipeline_alloc_buffers() (so a shortage is detected
+ * BEFORE the tasks run and can be handled by choosing a smaller frame), freed
+ * by pipeline_free_task_buffers() in teardown. Previously each task malloc'd
+ * its own buffer and a failure killed the stream after it had "started". */
+static int32_t *s_raw_buf = NULL;  /* I2S read buffer, samples_per_frame*ch int32 (32-bit only, may be IRAM) */
+static uint8_t *s_pkt_buf = NULL;  /* TX packet, PKT_HDR_SIZE + s_pkt_data_len */
+static int16_t *s_ch_left = NULL;  /* stereo ADPCM de-interleave */
+static int16_t *s_ch_right = NULL;
+
+static void pipeline_free_task_buffers(void)
+{
+    audio_buf_free(s_raw_buf);
+    audio_buf_free(s_pkt_buf);
+    audio_buf_free(s_ch_left);
+    audio_buf_free(s_ch_right);
+    s_raw_buf = NULL;
+    s_pkt_buf = NULL;
+    s_ch_left = NULL;
+    s_ch_right = NULL;
+}
+
 static pcm_frame_t *pcm_frame_alloc(int num_samples, int bits_per_sample, int codec_mode)
 {
     /* Only PCM 24-bit mode needs int32_t (raw sign-extended 24-bit values
@@ -158,7 +292,10 @@ static pcm_frame_t *pcm_frame_alloc(int num_samples, int bits_per_sample, int co
      * Allocating int32_t for ADPCM wastes 19 KB at 48kHz/stereo. */
     bool need_int32 = (bits_per_sample == 24) && (codec_mode == CODEC_MODE_PCM);
     size_t elem_size = need_int32 ? sizeof(int32_t) : sizeof(int16_t);
-    pcm_frame_t *f = malloc(sizeof(pcm_frame_t) + (size_t)num_samples * elem_size);
+    size_t bytes = sizeof(pcm_frame_t) + (size_t)num_samples * elem_size;
+    /* int32 frames are only ever accessed word-wise -> IRAM allowed;
+     * int16 frames (dither output / ADPCM input) must stay in DRAM. */
+    pcm_frame_t *f = need_int32 ? audio_buf_alloc32(bytes) : audio_buf_alloc(bytes);
     if (f)
         f->num_samples = num_samples;
     return f;
@@ -166,7 +303,7 @@ static pcm_frame_t *pcm_frame_alloc(int num_samples, int bits_per_sample, int co
 
 static adpcm_frame_t *adpcm_frame_alloc(int max_data_len)
 {
-    adpcm_frame_t *f = malloc(sizeof(adpcm_frame_t) + max_data_len);
+    adpcm_frame_t *f = audio_buf_alloc(sizeof(adpcm_frame_t) + (size_t)max_data_len);
     return f;
 }
 
@@ -177,7 +314,7 @@ static void drain_and_delete_queue(QueueHandle_t *q)
     void *item = NULL;
     while (xQueueReceive(*q, &item, 0) == pdTRUE)
     {
-        free(item);
+        audio_buf_free(item);
     }
     vQueueDelete(*q);
     *q = NULL;
@@ -217,10 +354,10 @@ static void i2s_task_fn(void *arg)
     ESP_LOGI(TAG, "[I2S] Task started (idx=%d)", idx);
 
     int total = s_samples_per_frame * s_channels;
-    int32_t *raw = malloc(total * sizeof(int32_t));
+    int32_t *raw = s_raw_buf; /* allocated by pipeline_alloc_buffers() */
     if (!raw)
     {
-        ESP_LOGE(TAG, "[I2S] alloc fail");
+        ESP_LOGE(TAG, "[I2S] raw buffer missing");
         svc_port_set_error(SVC_ERR_MEMORY);
         /* FR-PIPE / Roma #6: fatal exit — request stop so the rest of the
          * pipeline (adpcm/pcm + TX tasks) is torn down. Without this the
@@ -321,7 +458,13 @@ static void i2s_task_fn(void *arg)
              * 24-bit values). pcm_task_fn will strip the high byte and
              * emit 3 bytes per sample. No dither - we want full 24-bit
              * precision in the stream. */
-            memcpy(pcm_samples32(pcm), raw, (size_t)total * sizeof(int32_t));
+            /* Word copy on purpose: both buffers may live in IRAM (32-bit
+             * access only) — do not depend on memcpy()'s tail handling. */
+            {
+                int32_t *dst32 = pcm_samples32(pcm);
+                for (int i = 0; i < total; i++)
+                    dst32[i] = raw[i];
+            }
         }
         else if (is_24bit)
             dither_buffer_24_to_16(raw, pcm_samples16(pcm), total);
@@ -332,7 +475,7 @@ static void i2s_task_fn(void *arg)
             xQueueSend(pcm_free_queue, &pcm, 0);
     }
 
-    free(raw);
+    /* s_raw_buf is freed by teardown_pipeline() */
 
 task_exit:
     ESP_LOGI(TAG, "[I2S] Task exiting");
@@ -357,16 +500,13 @@ static void adpcm_task_fn(void *arg)
     /* FIX (FW#1): see FIXES.md — seq assigned in TX task after successful send. */
     int cap = DVI4_HEADER_SIZE + s_adpcm_frame_bytes;
 
-    int16_t *ch_left = NULL, *ch_right = NULL;
+    /* Allocated by pipeline_alloc_buffers() (stereo only). */
+    int16_t *ch_left = s_ch_left, *ch_right = s_ch_right;
     if (s_channels == 2)
     {
-        ch_left = malloc(s_samples_per_frame * sizeof(int16_t));
-        ch_right = malloc(s_samples_per_frame * sizeof(int16_t));
         if (!ch_left || !ch_right)
         {
-            ESP_LOGE(TAG, "[ADPCM] deinterleave alloc fail");
-            free(ch_left);
-            free(ch_right);
+            ESP_LOGE(TAG, "[ADPCM] deinterleave buffers missing");
             /* FR-PIPE / Roma #6: fatal exit — set error + request stop so the
              * rest of the pipeline is torn down. Previously this path only
              * freed + goto task_exit, leaving STREAM_EVT_ACTIVE set and the
@@ -456,7 +596,7 @@ static void adpcm_task_fn(void *arg)
         /* NOTE: timestamp_ms wraps at ~49.7 days (uint32_t). This is expected —
          * the receiver should handle 32-bit wraparound. See RFC 3550 §4.1.
          * FIX (F-C #6): documented wraparound semantics. */
-        adpcm->timestamp_ms = frame_count * s_frame_ms;
+        adpcm->timestamp_ms = pipeline_frame_timestamp_ms(frame_count); /* B4 fix */
 
         if (xQueueSend(adpcm_filled_queue, &adpcm, 0) != pdTRUE)
             xQueueSend(adpcm_free_queue, &adpcm, 0);
@@ -466,8 +606,7 @@ static void adpcm_task_fn(void *arg)
             ESP_LOGI(TAG, "[ADPCM] %" PRIu32 " frames encoded", frame_count);
     }
 
-    free(ch_left);
-    free(ch_right);
+    /* s_ch_left/right are freed by teardown_pipeline() */
 
 task_exit:
     ESP_LOGI(TAG, "[ADPCM] Task exiting");
@@ -563,7 +702,7 @@ static void pcm_task_fn(void *arg)
         /* NOTE: timestamp_ms wraps at ~49.7 days (uint32_t). This is expected —
          * the receiver should handle 32-bit wraparound. See RFC 3550 §4.1.
          * FIX (F-C #6): documented wraparound semantics. */
-        out->timestamp_ms = frame_count * s_frame_ms;
+        out->timestamp_ms = pipeline_frame_timestamp_ms(frame_count); /* B4 fix */
 
         if (xQueueSend(adpcm_filled_queue, &out, 0) != pdTRUE)
             xQueueSend(adpcm_free_queue, &out, 0);
@@ -630,10 +769,10 @@ static void stream_task_fn(void *arg)
              ops->name,
              wifi_sta_is_connected() ? "connected" : "WARN: not connected");
 
-    uint8_t *pkt = malloc(PKT_HDR_SIZE + s_pkt_data_len);
+    uint8_t *pkt = s_pkt_buf; /* allocated by pipeline_alloc_buffers() */
     if (!pkt)
     {
-        ESP_LOGE(TAG, "[%s] alloc fail", ops->name);
+        ESP_LOGE(TAG, "[%s] packet buffer missing", ops->name);
         svc_port_set_error(SVC_ERR_MEMORY);
         /* FIX (F-C #1): fatal exit — request stop so the rest of the pipeline
          * is torn down. */
@@ -748,7 +887,7 @@ static void stream_task_fn(void *arg)
                      ops->name, sent, dropped);
     }
 
-    free(pkt);
+    /* s_pkt_buf is freed by teardown_pipeline() */
 
 task_exit:
     ESP_LOGI(TAG, "[%s] Task exiting", ops->name);
@@ -983,6 +1122,7 @@ static void teardown_pipeline(bool full_transport_teardown)
     drain_and_delete_queue(&pcm_filled_queue);
     drain_and_delete_queue(&adpcm_free_queue);
     drain_and_delete_queue(&adpcm_filled_queue);
+    pipeline_free_task_buffers(); /* tasks are gone — safe now */
 
     for (int i = 0; i < 2; i++)
     {
@@ -1006,6 +1146,311 @@ static void teardown_pipeline(bool full_transport_teardown)
     stream_mode_ops()->on_stream_stopped();
 }
 
+/* ====================================================================
+ * Frame geometry
+ * ====================================================================
+ * Everything derived from (sample_rate, channels, codec, bits, frame_ms):
+ * s_frame_ms, s_samples_per_frame, s_adpcm_frame_bytes, codec ids, bitrate,
+ * s_pkt_data_len. `max_frame_ms` bounds the frame duration; start_streaming()
+ * calls this again with a smaller bound when the chosen frame does not fit
+ * in DRAM (B8 fix: 60 ms @ 48 kHz needed ~37 KB of contiguous DRAM and the
+ * stream died with "alloc fail"). Returns ESP_ERR_INVALID_STATE when the
+ * geometry is unusable (too few samples / packet > MTU). */
+static esp_err_t pipeline_compute_frame_params(const device_config_t *cfg, uint32_t max_frame_ms)
+{
+    /* Compute runtime audio parameters. frame_ms is computed adaptively
+     * from sample_rate and channels (even samples, DMA min 32, UDP MTU).
+     * FIX (4-C): see FIXES.md — RawTX uses the air-time constrained variant. */
+    s_sample_rate = cfg->sample_rate;
+    if (cfg->transport_mode == TRANSPORT_MODE_RAWTX)
+    {
+        s_frame_ms = i2s_capture_compute_frame_ms_rawtx_max(s_sample_rate, s_channels,
+                                                            cfg->codec_mode, cfg->bits_per_sample,
+                                                            max_frame_ms);
+    }
+    else
+    {
+        s_frame_ms = i2s_capture_compute_frame_ms_max(s_sample_rate, s_channels,
+                                                      cfg->codec_mode, cfg->bits_per_sample,
+                                                      max_frame_ms);
+    }
+    s_samples_per_frame = (int)(s_sample_rate * s_frame_ms / 1000);
+
+    /* Align samples_per_frame: 16-bit needs multiple of 8 (SLC word-align
+     * + rw_pos drift); 24-bit needs multiple of 4. */
+    if (cfg->bits_per_sample == 16)
+        s_samples_per_frame &= ~7; /* кратно 8: 661->656, 882->880, 220->216 */
+    else
+        s_samples_per_frame &= ~3; /* кратно 4 (24-bit) */
+
+    /* FIX (FW#2, GROK-21): see FIXES.md */
+    /* B4 fix: round to nearest instead of truncating (880 samples @ 44.1 kHz =
+     * 19.95 ms -> 20, not 19). s_frame_ms is only an approximation used for
+     * the packet header, timeouts and pool sizing; packet timestamps are
+     * computed exactly from the sample count (pipeline_frame_timestamp_ms). */
+    s_frame_ms = (uint32_t)(((uint64_t)s_samples_per_frame * 1000 + s_sample_rate / 2) / s_sample_rate);
+    if (s_frame_ms == 0)
+        s_frame_ms = 1;
+    /* FIX (F-C #4): s_frame_ms_known is intentionally NOT set here. It must
+     * only be set true after ALL subsequent validations succeed (samples<8
+     * check, MTU guard, WiFi/I2S init, pool alloc, task creation). Previously
+     * it was set on this line, so every early-return failure path (lines
+     * 1016, 1016, 1094, 1110, 1119, 1128, 1142, 1171, 1190, ...) left
+     * s_frame_ms_known=true; callers like streaming_get_frame_ms() /
+     * build_info_payload() then read a stale or placeholder frame_ms. The
+     * true assignment is now at the very end of start_streaming, right
+     * before `return ESP_OK;`. */
+
+    /* FIX (M14): see FIXES.md */
+    if (s_samples_per_frame < 8)
+    {
+        ESP_LOGE(TAG, "samples_per_frame=%d too small (frame_ms=%u, rate=%u) - aborting",
+                 s_samples_per_frame, (unsigned)s_frame_ms, (unsigned)s_sample_rate);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Computed frame_ms=%u (aligned) -> samples_per_frame=%d (rate=%u, ch=%u)",
+             (unsigned)s_frame_ms, s_samples_per_frame,
+             (unsigned)s_sample_rate, (unsigned)s_channels);
+
+    s_adpcm_frame_bytes = s_samples_per_frame / 2;
+    /* Update codec mode + bit depth from config BEFORE computing bitrate.
+     * Previously these were assigned AFTER the bitrate calc, so on the first
+     * stream after boot (or after AT+CODEC / AT+BITS change + HOTRESTART) the
+     * bitrate used stale s_codec_mode/s_bits_per_sample values — e.g. an ADPCM
+     * bitrate (4 bits/sample) was reported in the packet header for a PCM
+     * stream. The receiver then displays the wrong kbps and may mis-size
+     * buffers. */
+    s_codec_mode = cfg->codec_mode;
+    s_bits_per_sample = cfg->bits_per_sample;
+    s_sample_rate_enum = sample_rate_to_enum(s_sample_rate);
+    /* Bitrate depends on codec: ADPCM = 4 bits/sample, PCM = bits_per_sample
+     * bits/sample. Now uses the just-updated s_codec_mode/s_bits_per_sample. */
+    {
+        int bits_per_codec = (s_codec_mode == CODEC_MODE_PCM)
+                                 ? s_bits_per_sample
+                                 : 4;
+        s_audio_bitrate = s_sample_rate * (uint32_t)bits_per_codec * s_channels;
+    }
+
+    /* Codec-dependent packet payload size:
+     * ADPCM: [DVI4 hdr 4B][adpcm nibbles] per channel -> s_channels x (4 + samples/2)
+     * PCM 16-bit: [int16 samples]                       -> samples_per_frame x channels x 2
+     * PCM 24-bit: [3 bytes/sample, low bytes of int32]  -> samples_per_frame x channels x 3
+     * (24-bit packs to 3 bytes: int32_t sign-extended sample -> strip high byte) */
+    int adpcm_data_len, pcm_data_len;
+    if (s_codec_mode == CODEC_MODE_PCM)
+    {
+        int bytes_per_sample = (cfg->bits_per_sample == 24) ? 3 : 2;
+        pcm_data_len = s_samples_per_frame * s_channels * bytes_per_sample;
+        adpcm_data_len = 0;
+        s_pkt_codec_id = CODEC_ID_PCM;
+        s_pkt_data_len = pcm_data_len;
+    }
+    else
+    {
+        adpcm_data_len = s_channels * (DVI4_HEADER_SIZE + s_adpcm_frame_bytes);
+        pcm_data_len = 0;
+        s_pkt_codec_id = CODEC_ID_ADPCM;
+        s_pkt_data_len = adpcm_data_len;
+    }
+
+    /* UDP MTU guard. For PCM at high sample rates, frame_ms is auto-reduced
+     * by i2s_capture_compute_frame_ms, but we re-check here. */
+    int max_pkt_len = PKT_HDR_SIZE + s_pkt_data_len;
+    if (max_pkt_len > UDP_MTU_BYTES)
+    {
+        ESP_LOGE(TAG, "Packet size %d bytes exceeds UDP MTU (%d). "
+                      "Reduce sample rate, frame duration, channels, or use ADPCM. "
+                      "(rate=%u, frame=%ums, ch=%u, codec=%s)",
+                 max_pkt_len, UDP_MTU_BYTES, (unsigned)s_sample_rate, (unsigned)s_frame_ms, (unsigned)s_channels,
+                 s_codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Audio: %u Hz, %u ms, %u ch, %d samples/frame, codec=%s, %d bytes/pkt, %u bps",
+             (unsigned)s_sample_rate, (unsigned)s_frame_ms, (unsigned)s_channels,
+             s_samples_per_frame,
+             s_codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM",
+             s_pkt_data_len, (unsigned)s_audio_bitrate);
+
+    return ESP_OK;
+}
+
+/* ====================================================================
+ * Pools + task buffers for the current frame geometry
+ * ====================================================================
+ * Creates the four queues, fills the PCM/ADPCM pools and allocates the task
+ * buffers (raw / pkt / stereo de-interleave). Everything is DRAM
+ * (MALLOC_CAP_8BIT). Returns ESP_ERR_NO_MEM on the first failure and leaves
+ * the partial state for pipeline_free_buffers(). */
+static esp_err_t pipeline_alloc_buffers(const device_config_t *cfg)
+{
+    /* 7. Queues & pools — sizes computed adaptively from free heap and
+     * frame_ms. Target: 100ms PCM (I2S->ADPCM), 200ms ADPCM (encoder->UDP,
+     * protects against WiFi jitter). pool_size = buffer_ms / frame_ms,
+     * clamped to [min, max]. Memory budget: max 2/5 of free heap combined. */
+    int samples_per_pcm = s_samples_per_frame * s_channels;
+    bool need_int32 = (s_bits_per_sample == 24) && (s_codec_mode == CODEC_MODE_PCM);
+    size_t pcm_elem_size = need_int32 ? sizeof(int32_t) : sizeof(int16_t);
+    int pcm_frame_bytes = (int)sizeof(pcm_frame_t) + samples_per_pcm * (int)pcm_elem_size;
+    int adpcm_frame_bytes = (int)sizeof(adpcm_frame_t) + s_pkt_data_len;
+
+    /* 7. Queues & pools — sizes computed adaptively from free heap,
+     * frame_ms, codec and transport.
+     *
+     * pcm_pool  — buffer between I2S and the encoder/packer task:
+     *   ADPCM:    encoder is CPU-heavy        -> 100 ms
+     *   PCM 24b:  4B->3B conversion           ->  60 ms
+     *   PCM 16b:  plain memcpy                ->  30 ms
+     *
+     * adpcm_pool — buffer between encoder/packer and TX (network jitter):
+     *   TCP:      blocking send (SO_SNDTIMEO) -> 200 ms (do NOT shrink)
+     *   UDP/RAWTX: non-blocking send          -> 100 ms
+     *
+     * pool_size = buffer_ms / frame_ms, clamped to [min, max].
+     * Memory budget: max 2/5 of free heap combined (unchanged). */
+    int pcm_target_ms, adpcm_target_ms;
+
+    if (s_codec_mode == CODEC_MODE_ADPCM)
+    {
+        pcm_target_ms = 100;
+        adpcm_target_ms = (cfg->transport_mode == TRANSPORT_MODE_TCP) ? 200 : 150;
+    }
+    else if (s_bits_per_sample == 24)
+    {
+        pcm_target_ms = 60;
+        adpcm_target_ms = (cfg->transport_mode == TRANSPORT_MODE_TCP) ? 200 : 100;
+    }
+    else /* PCM 16-bit */
+    {
+        pcm_target_ms = 30;
+        adpcm_target_ms = (cfg->transport_mode == TRANSPORT_MODE_TCP) ? 200 : 100;
+    }
+
+    s_pcm_pool_size = pcm_target_ms / s_frame_ms;
+    s_adpcm_pool_size = adpcm_target_ms / s_frame_ms;
+
+    /* Clamps: PCM packer is fast -> smaller pcm_pool cap is safe.
+     * TCP needs a deeper adpcm_pool (blocking send backpressure). */
+    int pcm_max = (s_codec_mode == CODEC_MODE_PCM) ? 6 : PCM_POOL_MAX;
+    int adpcm_max = (cfg->transport_mode == TRANSPORT_MODE_TCP)
+                        ? ADPCM_POOL_MAX /* 16 — TCP blocking */
+                        : 10;            /* UDP/RAWTX non-blocking */
+
+    if (s_pcm_pool_size < PCM_POOL_MIN)
+        s_pcm_pool_size = PCM_POOL_MIN;
+    if (s_pcm_pool_size > pcm_max)
+        s_pcm_pool_size = pcm_max;
+    if (s_adpcm_pool_size < ADPCM_POOL_MIN)
+        s_adpcm_pool_size = ADPCM_POOL_MIN;
+    if (s_adpcm_pool_size > adpcm_max)
+        s_adpcm_pool_size = adpcm_max;
+    // оригинальн
+    /*     s_pcm_pool_size = 100 / s_frame_ms;
+        s_adpcm_pool_size = 200 / s_frame_ms;
+        if (s_pcm_pool_size < PCM_POOL_MIN)
+            s_pcm_pool_size = PCM_POOL_MIN;
+        if (s_pcm_pool_size > PCM_POOL_MAX)
+            s_pcm_pool_size = PCM_POOL_MAX;
+        if (s_adpcm_pool_size < ADPCM_POOL_MIN)
+            s_adpcm_pool_size = ADPCM_POOL_MIN;
+        if (s_adpcm_pool_size > ADPCM_POOL_MAX)
+            s_adpcm_pool_size = ADPCM_POOL_MAX;  */
+
+    /* Memory budget: max 2/5 of free heap for both pools combined. */
+    uint32_t free_heap = esp_get_free_heap_size();
+    uint32_t pool_mem = (uint32_t)(s_pcm_pool_size * pcm_frame_bytes +
+                                   s_adpcm_pool_size * adpcm_frame_bytes);
+    uint32_t mem_budget = free_heap * POOL_BUDGET_FRACTION / POOL_BUDGET_DIVISOR;
+    if (pool_mem > mem_budget && pool_mem > 0)
+    {
+        int scale = (int)(mem_budget * 100U / pool_mem);
+        s_pcm_pool_size = (s_pcm_pool_size * scale) / 100;
+        s_adpcm_pool_size = (s_adpcm_pool_size * scale) / 100;
+        if (s_pcm_pool_size < 2)
+            s_pcm_pool_size = 2;
+        if (s_adpcm_pool_size < 2)
+            s_adpcm_pool_size = 2;
+        ESP_LOGW(TAG, "Pool sizes reduced to fit memory: pcm=%d adpcm=%d (heap=%u)",
+                 s_pcm_pool_size, s_adpcm_pool_size, (unsigned)free_heap);
+    }
+
+    ESP_LOGI(TAG, "Pools: pcm=%dx%d=%uB, adpcm=%dx%d=%uB (heap=%u, budget=%u)",
+             s_pcm_pool_size, pcm_frame_bytes,
+             (unsigned)(s_pcm_pool_size * pcm_frame_bytes),
+             s_adpcm_pool_size, adpcm_frame_bytes,
+             (unsigned)(s_adpcm_pool_size * adpcm_frame_bytes),
+             (unsigned)free_heap, (unsigned)mem_budget);
+
+    pcm_free_queue = xQueueCreate(s_pcm_pool_size, sizeof(pcm_frame_t *));
+    pcm_filled_queue = xQueueCreate(s_pcm_pool_size, sizeof(pcm_frame_t *));
+    adpcm_free_queue = xQueueCreate(s_adpcm_pool_size, sizeof(adpcm_frame_t *));
+    adpcm_filled_queue = xQueueCreate(s_adpcm_pool_size, sizeof(adpcm_frame_t *));
+    if (!pcm_free_queue || !pcm_filled_queue ||
+        !adpcm_free_queue || !adpcm_filled_queue)
+    {
+        ESP_LOGE(TAG, "Failed to create queues");
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (int i = 0; i < s_pcm_pool_size; i++)
+    {
+        pcm_frame_t *f = pcm_frame_alloc(samples_per_pcm, s_bits_per_sample, s_codec_mode);
+        if (!f)
+        {
+            ESP_LOGW(TAG, "PCM pool alloc fail (%d x %d B)", s_pcm_pool_size, pcm_frame_bytes);
+            return ESP_ERR_NO_MEM;
+        }
+        xQueueSend(pcm_free_queue, &f, 0);
+    }
+
+    for (int i = 0; i < s_adpcm_pool_size; i++)
+    {
+        adpcm_frame_t *f = adpcm_frame_alloc(s_pkt_data_len);
+        if (!f)
+        {
+            ESP_LOGW(TAG, "ADPCM pool alloc fail (%d x %d B)", s_adpcm_pool_size, adpcm_frame_bytes);
+            return ESP_ERR_NO_MEM;
+        }
+        xQueueSend(adpcm_free_queue, &f, 0);
+    }
+
+    /* Task buffers (see s_raw_buf & co. above). raw is 32-bit-only -> may
+     * take IRAM (audio_buf_alloc32); pkt is written byte-wise -> DRAM. */
+    s_raw_buf = audio_buf_alloc32((size_t)samples_per_pcm * sizeof(int32_t));
+    s_pkt_buf = audio_buf_alloc((size_t)(PKT_HDR_SIZE + s_pkt_data_len));
+    if (!s_raw_buf || !s_pkt_buf)
+    {
+        ESP_LOGW(TAG, "task buffer alloc fail (raw %u B, pkt %u B)",
+                 (unsigned)((size_t)samples_per_pcm * sizeof(int32_t)),
+                 (unsigned)(PKT_HDR_SIZE + s_pkt_data_len));
+        return ESP_ERR_NO_MEM;
+    }
+    if (s_codec_mode == CODEC_MODE_ADPCM && s_channels == 2)
+    {
+        s_ch_left = audio_buf_alloc((size_t)s_samples_per_frame * sizeof(int16_t));
+        s_ch_right = audio_buf_alloc((size_t)s_samples_per_frame * sizeof(int16_t));
+        if (!s_ch_left || !s_ch_right)
+        {
+            ESP_LOGW(TAG, "de-interleave buffer alloc fail (2 x %u B)",
+                     (unsigned)((size_t)s_samples_per_frame * sizeof(int16_t)));
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+/* Undo pipeline_alloc_buffers() (safe on partial state). */
+static void pipeline_free_buffers(void)
+{
+    drain_and_delete_queue(&pcm_free_queue);
+    drain_and_delete_queue(&pcm_filled_queue);
+    drain_and_delete_queue(&adpcm_free_queue);
+    drain_and_delete_queue(&adpcm_filled_queue);
+    pipeline_free_task_buffers();
+}
+
 esp_err_t start_streaming(void)
 {
     if (streaming_is_active())
@@ -1014,6 +1459,8 @@ esp_err_t start_streaming(void)
          * Not an error - just ignore. */
         return ESP_ERR_INVALID_STATE;
     }
+
+    esp_err_t fail_err = ESP_FAIL; /* returned via cleanup_on_fail */
 
     /* FIX (A1, MEDIUM #37): see FIXES.md */
     for (int i = 0; i < TASK_IDX_COUNT; i++)
@@ -1077,112 +1524,12 @@ esp_err_t start_streaming(void)
     ops->set_channels(s_channels);
 
     /* Compute runtime audio parameters. frame_ms is computed adaptively
-     * from sample_rate and channels (even samples, DMA min 32, UDP MTU).
-     * FIX (4-C): see FIXES.md — RawTX uses the air-time constrained variant. */
-    s_sample_rate = cfg.sample_rate;
-    if (cfg.transport_mode == TRANSPORT_MODE_RAWTX)
-    {
-        s_frame_ms = i2s_capture_compute_frame_ms_rawtx(s_sample_rate, s_channels,
-                                                        cfg.codec_mode, cfg.bits_per_sample);
-    }
-    else
-    {
-        s_frame_ms = i2s_capture_compute_frame_ms(s_sample_rate, s_channels,
-                                                  cfg.codec_mode, cfg.bits_per_sample);
-    }
-    s_samples_per_frame = (int)(s_sample_rate * s_frame_ms / 1000);
-
-    /* Align samples_per_frame: 16-bit needs multiple of 8 (SLC word-align
-     * + rw_pos drift); 24-bit needs multiple of 4. */
-    if (cfg.bits_per_sample == 16)
-        s_samples_per_frame &= ~7; /* кратно 8: 661->656, 882->880, 220->216 */
-    else
-        s_samples_per_frame &= ~3; /* кратно 4 (24-bit) */
-
-    /* FIX (FW#2, GROK-21): see FIXES.md */
-    s_frame_ms = (uint32_t)((uint64_t)s_samples_per_frame * 1000 / s_sample_rate);
-    /* FIX (F-C #4): s_frame_ms_known is intentionally NOT set here. It must
-     * only be set true after ALL subsequent validations succeed (samples<8
-     * check, MTU guard, WiFi/I2S init, pool alloc, task creation). Previously
-     * it was set on this line, so every early-return failure path (lines
-     * 1016, 1016, 1094, 1110, 1119, 1128, 1142, 1171, 1190, ...) left
-     * s_frame_ms_known=true; callers like streaming_get_frame_ms() /
-     * build_info_payload() then read a stale or placeholder frame_ms. The
-     * true assignment is now at the very end of start_streaming, right
-     * before `return ESP_OK;`. */
-
-    /* FIX (M14): see FIXES.md */
-    if (s_samples_per_frame < 8)
-    {
-        ESP_LOGE(TAG, "samples_per_frame=%d too small (frame_ms=%u, rate=%u) - aborting",
-                 s_samples_per_frame, (unsigned)s_frame_ms, (unsigned)s_sample_rate);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_LOGI(TAG, "Computed frame_ms=%u (aligned) -> samples_per_frame=%d (rate=%u, ch=%u)",
-             (unsigned)s_frame_ms, s_samples_per_frame,
-             (unsigned)s_sample_rate, (unsigned)s_channels);
-
-    s_adpcm_frame_bytes = s_samples_per_frame / 2;
-    /* Update codec mode + bit depth from config BEFORE computing bitrate.
-     * Previously these were assigned AFTER the bitrate calc, so on the first
-     * stream after boot (or after AT+CODEC / AT+BITS change + HOTRESTART) the
-     * bitrate used stale s_codec_mode/s_bits_per_sample values — e.g. an ADPCM
-     * bitrate (4 bits/sample) was reported in the packet header for a PCM
-     * stream. The receiver then displays the wrong kbps and may mis-size
-     * buffers. */
-    s_codec_mode = cfg.codec_mode;
-    s_bits_per_sample = cfg.bits_per_sample;
-    s_sample_rate_enum = sample_rate_to_enum(s_sample_rate);
-    /* Bitrate depends on codec: ADPCM = 4 bits/sample, PCM = bits_per_sample
-     * bits/sample. Now uses the just-updated s_codec_mode/s_bits_per_sample. */
-    {
-        int bits_per_codec = (s_codec_mode == CODEC_MODE_PCM)
-                                 ? s_bits_per_sample
-                                 : 4;
-        s_audio_bitrate = s_sample_rate * (uint32_t)bits_per_codec * s_channels;
-    }
-
-    /* Codec-dependent packet payload size:
-     * ADPCM: [DVI4 hdr 4B][adpcm nibbles] per channel -> s_channels x (4 + samples/2)
-     * PCM 16-bit: [int16 samples]                       -> samples_per_frame x channels x 2
-     * PCM 24-bit: [3 bytes/sample, low bytes of int32]  -> samples_per_frame x channels x 3
-     * (24-bit packs to 3 bytes: int32_t sign-extended sample -> strip high byte) */
-    int adpcm_data_len, pcm_data_len;
-    if (s_codec_mode == CODEC_MODE_PCM)
-    {
-        int bytes_per_sample = (cfg.bits_per_sample == 24) ? 3 : 2;
-        pcm_data_len = s_samples_per_frame * s_channels * bytes_per_sample;
-        adpcm_data_len = 0;
-        s_pkt_codec_id = CODEC_ID_PCM;
-        s_pkt_data_len = pcm_data_len;
-    }
-    else
-    {
-        adpcm_data_len = s_channels * (DVI4_HEADER_SIZE + s_adpcm_frame_bytes);
-        pcm_data_len = 0;
-        s_pkt_codec_id = CODEC_ID_ADPCM;
-        s_pkt_data_len = adpcm_data_len;
-    }
-
-    /* UDP MTU guard. For PCM at high sample rates, frame_ms is auto-reduced
-     * by i2s_capture_compute_frame_ms, but we re-check here. */
-    int max_pkt_len = PKT_HDR_SIZE + s_pkt_data_len;
-    if (max_pkt_len > UDP_MTU_BYTES)
-    {
-        ESP_LOGE(TAG, "Packet size %d bytes exceeds UDP MTU (%d). "
-                      "Reduce sample rate, frame duration, channels, or use ADPCM. "
-                      "(rate=%u, frame=%ums, ch=%u, codec=%s)",
-                 max_pkt_len, UDP_MTU_BYTES, (unsigned)s_sample_rate, (unsigned)s_frame_ms, (unsigned)s_channels,
-                 s_codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_LOGI(TAG, "Audio: %u Hz, %u ms, %u ch, %d samples/frame, codec=%s, %d bytes/pkt, %u bps",
-             (unsigned)s_sample_rate, (unsigned)s_frame_ms, (unsigned)s_channels,
-             s_samples_per_frame,
-             s_codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM",
-             s_pkt_data_len, (unsigned)s_audio_bitrate);
+     * from sample_rate and channels (even samples, DMA min 32, UDP MTU) —
+     * see pipeline_compute_frame_params(). Upper bound: menuconfig
+     * STREAMER_MAX_FRAME_MS; it is lowered below if DRAM is short. */
+    esp_err_t err = pipeline_compute_frame_params(&cfg, (uint32_t)AUDIO_MAX_FRAME_MS);
+    if (err != ESP_OK)
+        return err;
 
     /* 1. WiFi - initialize (if not done at boot) and wait for readiness. */
     /* FIX (F-C #8): For RawTX, the WiFi channel can only be applied inside
@@ -1213,7 +1560,7 @@ esp_err_t start_streaming(void)
 
     if (!s_wifi_initialized)
     {
-        esp_err_t err = ops->wifi_init(&cfg);
+        err = ops->wifi_init(&cfg);
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(err));
@@ -1226,7 +1573,7 @@ esp_err_t start_streaming(void)
             s_rawtx_wifi_channel = cfg.wifi_channel;
     }
 
-    esp_err_t err = ops->wifi_wait_ready(&cfg);
+    err = ops->wifi_wait_ready(&cfg);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "WiFi not ready: %s", esp_err_to_name(err));
@@ -1238,20 +1585,6 @@ esp_err_t start_streaming(void)
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Service port init failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /* 3. I2S capture. DMA-размеры и таймауты выводятся из samples_per_frame. */
-    err = i2s_capture_init(s_sample_rate, cfg.bits_per_sample,
-                           cfg.comm_format, cfg.channel_format,
-                           s_samples_per_frame, s_frame_ms,
-                           cfg.gain, cfg.agc_mode,
-                           cfg.i2s_timing_sd_delay,
-                           cfg.i2s_timing_ws_delay,
-                           cfg.i2s_timing_bck_delay);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "I2S init failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -1303,134 +1636,82 @@ esp_err_t start_streaming(void)
         return err;
     }
 
-    /* 7. Queues & pools — sizes computed adaptively from free heap and
-     * frame_ms. Target: 100ms PCM (I2S->ADPCM), 200ms ADPCM (encoder->UDP,
-     * protects against WiFi jitter). pool_size = buffer_ms / frame_ms,
-     * clamped to [min, max]. Memory budget: max 2/5 of free heap combined. */
-    int samples_per_pcm = s_samples_per_frame * s_channels;
-    bool need_int32 = (s_bits_per_sample == 24) && (s_codec_mode == CODEC_MODE_PCM);
-    size_t pcm_elem_size = need_int32 ? sizeof(int32_t) : sizeof(int16_t);
-    int pcm_frame_bytes = (int)sizeof(pcm_frame_t) + samples_per_pcm * (int)pcm_elem_size;
-    int adpcm_frame_bytes = (int)sizeof(adpcm_frame_t) + s_pkt_data_len;
 
-    /* 7. Queues & pools — sizes computed adaptively from free heap,
-     * frame_ms, codec and transport.
+    /* 3 + 7. Frame-dependent resources: pools, task buffers, I2S DMA rings.
      *
-     * pcm_pool  — buffer between I2S and the encoder/packer task:
-     *   ADPCM:    encoder is CPU-heavy        -> 100 ms
-     *   PCM 24b:  4B->3B conversion           ->  60 ms
-     *   PCM 16b:  plain memcpy                ->  30 ms
-     *
-     * adpcm_pool — buffer between encoder/packer and TX (network jitter):
-     *   TCP:      blocking send (SO_SNDTIMEO) -> 200 ms (do NOT shrink)
-     *   UDP/RAWTX: non-blocking send          -> 100 ms
-     *
-     * pool_size = buffer_ms / frame_ms, clamped to [min, max].
-     * Memory budget: max 2/5 of free heap combined (unchanged). */
-    int pcm_target_ms, adpcm_target_ms;
-
-    if (s_codec_mode == CODEC_MODE_ADPCM)
+     * All of them live in DRAM now (B2 fix), and a 50-60 ms frame at 48 kHz
+     * needs ~37 KB of it — more than this board has left next to WiFi/lwIP.
+     * Instead of failing (or worse: starting and then dying in a task with
+     * "alloc fail"), fall back to the next smaller frame duration until the
+     * buffers actually allocate and two packet pbufs still fit
+     * (pipeline_dram_can_send). Pools are tried first (cheap to undo); the
+     * I2S driver last (its init includes a DMA flush). */
     {
-        pcm_target_ms = 100;
-        adpcm_target_ms = (cfg.transport_mode == TRANSPORT_MODE_TCP) ? 200 : 150;
-    }
-    else if (s_bits_per_sample == 24)
-    {
-        pcm_target_ms = 60;
-        adpcm_target_ms = (cfg.transport_mode == TRANSPORT_MODE_TCP) ? 200 : 100;
-    }
-    else /* PCM 16-bit */
-    {
-        pcm_target_ms = 30;
-        adpcm_target_ms = (cfg.transport_mode == TRANSPORT_MODE_TCP) ? 200 : 100;
-    }
-
-    s_pcm_pool_size = pcm_target_ms / s_frame_ms;
-    s_adpcm_pool_size = adpcm_target_ms / s_frame_ms;
-
-    /* Clamps: PCM packer is fast -> smaller pcm_pool cap is safe.
-     * TCP needs a deeper adpcm_pool (blocking send backpressure). */
-    int pcm_max = (s_codec_mode == CODEC_MODE_PCM) ? 6 : PCM_POOL_MAX;
-    int adpcm_max = (cfg.transport_mode == TRANSPORT_MODE_TCP)
-                        ? ADPCM_POOL_MAX /* 16 — TCP blocking */
-                        : 10;            /* UDP/RAWTX non-blocking */
-
-    if (s_pcm_pool_size < PCM_POOL_MIN)
-        s_pcm_pool_size = PCM_POOL_MIN;
-    if (s_pcm_pool_size > pcm_max)
-        s_pcm_pool_size = pcm_max;
-    if (s_adpcm_pool_size < ADPCM_POOL_MIN)
-        s_adpcm_pool_size = ADPCM_POOL_MIN;
-    if (s_adpcm_pool_size > adpcm_max)
-        s_adpcm_pool_size = adpcm_max;
-    // оригинальн
-    /*     s_pcm_pool_size = 100 / s_frame_ms;
-        s_adpcm_pool_size = 200 / s_frame_ms;
-        if (s_pcm_pool_size < PCM_POOL_MIN)
-            s_pcm_pool_size = PCM_POOL_MIN;
-        if (s_pcm_pool_size > PCM_POOL_MAX)
-            s_pcm_pool_size = PCM_POOL_MAX;
-        if (s_adpcm_pool_size < ADPCM_POOL_MIN)
-            s_adpcm_pool_size = ADPCM_POOL_MIN;
-        if (s_adpcm_pool_size > ADPCM_POOL_MAX)
-            s_adpcm_pool_size = ADPCM_POOL_MAX;  */
-
-    /* Memory budget: max 2/5 of free heap for both pools combined. */
-    uint32_t free_heap = esp_get_free_heap_size();
-    uint32_t pool_mem = (uint32_t)(s_pcm_pool_size * pcm_frame_bytes +
-                                   s_adpcm_pool_size * adpcm_frame_bytes);
-    uint32_t mem_budget = free_heap * POOL_BUDGET_FRACTION / POOL_BUDGET_DIVISOR;
-    if (pool_mem > mem_budget && pool_mem > 0)
-    {
-        int scale = (int)(mem_budget * 100U / pool_mem);
-        s_pcm_pool_size = (s_pcm_pool_size * scale) / 100;
-        s_adpcm_pool_size = (s_adpcm_pool_size * scale) / 100;
-        if (s_pcm_pool_size < 2)
-            s_pcm_pool_size = 2;
-        if (s_adpcm_pool_size < 2)
-            s_adpcm_pool_size = 2;
-        ESP_LOGW(TAG, "Pool sizes reduced to fit memory: pcm=%d adpcm=%d (heap=%u)",
-                 s_pcm_pool_size, s_adpcm_pool_size, (unsigned)free_heap);
-    }
-
-    ESP_LOGI(TAG, "Pools: pcm=%dx%d=%uB, adpcm=%dx%d=%uB (heap=%u, budget=%u)",
-             s_pcm_pool_size, pcm_frame_bytes,
-             (unsigned)(s_pcm_pool_size * pcm_frame_bytes),
-             s_adpcm_pool_size, adpcm_frame_bytes,
-             (unsigned)(s_adpcm_pool_size * adpcm_frame_bytes),
-             (unsigned)free_heap, (unsigned)mem_budget);
-
-    pcm_free_queue = xQueueCreate(s_pcm_pool_size, sizeof(pcm_frame_t *));
-    pcm_filled_queue = xQueueCreate(s_pcm_pool_size, sizeof(pcm_frame_t *));
-    adpcm_free_queue = xQueueCreate(s_adpcm_pool_size, sizeof(adpcm_frame_t *));
-    adpcm_filled_queue = xQueueCreate(s_adpcm_pool_size, sizeof(adpcm_frame_t *));
-    if (!pcm_free_queue || !pcm_filled_queue ||
-        !adpcm_free_queue || !adpcm_filled_queue)
-    {
-        ESP_LOGE(TAG, "Failed to create queues");
-        goto cleanup_on_fail;
-    }
-
-    for (int i = 0; i < s_pcm_pool_size; i++)
-    {
-        pcm_frame_t *f = pcm_frame_alloc(samples_per_pcm, s_bits_per_sample, s_codec_mode);
-        if (!f)
+        int attempt = 0;
+        for (;;)
         {
-            ESP_LOGE(TAG, "PCM alloc fail");
-            goto cleanup_on_fail;
-        }
-        xQueueSend(pcm_free_queue, &f, 0);
-    }
+            attempt++;
+            err = pipeline_alloc_buffers(&cfg);
 
-    for (int i = 0; i < s_adpcm_pool_size; i++)
-    {
-        adpcm_frame_t *f = adpcm_frame_alloc(s_pkt_data_len);
-        if (!f)
-        {
-            ESP_LOGE(TAG, "ADPCM alloc fail");
-            goto cleanup_on_fail;
+            if (err == ESP_OK)
+            {
+                err = i2s_capture_init(s_sample_rate, cfg.bits_per_sample,
+                                       cfg.comm_format, cfg.channel_format,
+                                       s_samples_per_frame, s_frame_ms,
+                                       cfg.gain, cfg.agc_mode,
+                                       cfg.i2s_timing_sd_delay,
+                                       cfg.i2s_timing_ws_delay,
+                                       cfg.i2s_timing_bck_delay);
+                if (err == ESP_OK && !pipeline_dram_can_send())
+                {
+                    esp_err_t derr = i2s_capture_deinit();
+                    if (derr != ESP_OK)
+                        ESP_LOGW(TAG, "i2s_capture_deinit: %s", esp_err_to_name(derr));
+                    err = ESP_ERR_NO_MEM;
+                }
+            }
+
+            if (err == ESP_OK)
+                break;
+
+            pipeline_free_buffers();
+
+            if (err != ESP_ERR_NO_MEM)
+            {
+                ESP_LOGE(TAG, "I2S init failed: %s", esp_err_to_name(err));
+                fail_err = err;
+                goto cleanup_on_fail;
+            }
+
+            /* Not enough DRAM for this frame: try the next smaller one. */
+            uint32_t prev_ms = s_frame_ms;
+            if (prev_ms <= (uint32_t)I2S_CAP_MIN_FRAME_MS)
+            {
+                ESP_LOGE(TAG, "Not enough DRAM even for a %u ms frame - cannot start "
+                              "(rate=%u, ch=%u, codec=%s)",
+                         (unsigned)prev_ms, (unsigned)s_sample_rate, (unsigned)s_channels,
+                         s_codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM");
+                fail_err = ESP_ERR_NO_MEM;
+                goto cleanup_on_fail;
+            }
+            esp_err_t perr = pipeline_compute_frame_params(&cfg, prev_ms - 1);
+            if (perr != ESP_OK || s_frame_ms >= prev_ms)
+            {
+                ESP_LOGE(TAG, "No smaller frame than %u ms is usable - cannot start",
+                         (unsigned)prev_ms);
+                fail_err = (perr != ESP_OK) ? perr : ESP_ERR_NO_MEM;
+                goto cleanup_on_fail;
+            }
+            ESP_LOGI(TAG, "Frame %u ms does not fit in DRAM - retrying with %u ms (attempt %d)",
+                     (unsigned)prev_ms, (unsigned)s_frame_ms, attempt);
         }
-        xQueueSend(adpcm_free_queue, &f, 0);
+
+        if (attempt > 1)
+        {
+            ESP_LOGW(TAG, "Frame duration reduced to %u ms to fit DRAM (%d attempts). "
+                          "Set STREAMER_MAX_FRAME_MS=%u to skip the retries at every start.",
+                     (unsigned)s_frame_ms, attempt, (unsigned)s_frame_ms);
+        }
     }
 
     /* 8. Per-task done semaphores. */
@@ -1501,7 +1782,7 @@ esp_err_t start_streaming(void)
 
 cleanup_on_fail:
     teardown_pipeline(true);
-    return ESP_FAIL;
+    return fail_err;
 }
 
 void stop_streaming(void)
@@ -1516,3 +1797,4 @@ void stop_streaming(void)
     teardown_pipeline(false);
     ESP_LOGI(TAG, "Streaming stopped");
 }
+
