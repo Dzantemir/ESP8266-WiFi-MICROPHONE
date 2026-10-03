@@ -102,8 +102,8 @@ static volatile bool s_dump_in_progress;
 typedef struct
 {
     uint32_t off;
-    uint32_t len : 24;
-    uint32_t arena : 8;
+    /* Packed: low 24 bits = length, high 8 bits = arena id. */
+    uint32_t len_arena;
 } mxr_dfd_entry_t;
 
 static mxr_dfd_entry_t s_dfd_ring[MXR_DFD_RING_SIZE];
@@ -118,6 +118,9 @@ static uint8_t *s_arena_base;
 static uint32_t s_arena_total_bytes MXR_IRAM_DATA_ATTR;
 static uint32_t s_dram_free_bytes MXR_IRAM_DATA_ATTR;
 static uint32_t s_dram_min_free_bytes MXR_IRAM_DATA_ATTR;
+/* Historical minimum for DRAM + non-EXEC IRAM fallback, i.e. the aggregate
+ * pool used by caps==0 and pure 32-bit/internal queries. */
+static uint32_t s_dram_fb_min_free_bytes MXR_IRAM_DATA_ATTR;
 static bool s_initialized;
 
 /* Размещение по MXR_STATE_PLACEMENT (см. шапку файла) */
@@ -139,6 +142,7 @@ static uint32_t s_iram_fallback_allocs MXR_IRAM_DATA_ATTR;
 /* ---- IRAM fallback zone + regions ---- */
 static uint32_t s_iram_fb_zone_start MXR_IRAM_DATA_ATTR;
 static uint32_t s_iram_fb_zone_total MXR_IRAM_DATA_ATTR;
+static uint32_t s_iram_fb_free_bytes MXR_IRAM_DATA_ATTR;
 /* Скаляр оставляем всегда (1 байт): нужен в status/dump,
  * при выключенном fallback всегда == 0 */
 static uint8_t s_iram_fb_region_count;
@@ -154,46 +158,57 @@ static mxr_region_t s_iram_fb_region[MXR_IRAM_FB_REGION_COUNT] MXR_STATE_DATA_AT
 /* Размещение по MXR_STATE_PLACEMENT (см. шапку файла) */
 static mxr_region_t s_region[MXR_ACTIVE_TOTAL_REGIONS] MXR_STATE_DATA_ATTR;
 
-static uint8_t mxr_parse_region_config(const char *s, mxr_region_cfg_t *out, uint8_t max_count);
+static int16_t mxr_parse_region_config(const char *s, mxr_region_cfg_t *out, uint8_t max_count);
+static size_t mxr_get_largest_free_block_caps_locked(uint32_t caps);
+static size_t mxr_get_largest_user_block_locked(void);
 #if MXR_DESC_DYNAMIC_ACTIVE
+static bool mxr_dram_table_can_grow_for(uint32_t off_bytes, uint32_t len_bytes);
 static bool mxr_dram_table_grow(void);
 static void mxr_dram_table_maybe_shrink(void);
 #endif
+#ifdef CONFIG_MXR_USE_IRAM
 #if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+static bool mxr_iram_table_can_grow_for(uint32_t off_bytes, uint32_t len_bytes);
 static bool mxr_iram_table_grow(void);
 static void mxr_iram_table_maybe_shrink(void);
+#endif
 #endif
 static size_t mxr_get_total_size_caps_locked(uint32_t caps);
 static size_t mxr_get_free_size_caps_locked(uint32_t caps);
 /* ================================================================
  *  Word-aligned memory helpers (IRAM-safe, no libc)
  * ================================================================ */
-static inline void MXR_IRAM_ALLOC_ATTR mxr_memset4(void *ptr, size_t bytes)
+/* FIX(#7): было MXR_IRAM_ALLOC_ATTR — при CORE-only этот атрибут пуст,
+ * а helpers вызываются из IRAM core-путей (сдвиги таблиц, grow/shrink).
+ * inline не гарантирует встраивания: невстроенная функция осталась бы
+ * во flash и была бы недоступна при отключённом кэше. */
+/* Volatile word lvalues prevent compiler replacement with bytewise libc routines. */
+static inline void MXR_IRAM_ATTR mxr_memset4(void *ptr, size_t bytes)
 {
-    uint32_t *p = (uint32_t *)ptr;
+    volatile uint32_t *p = (volatile uint32_t *)ptr;
     size_t words = bytes >> 2;
     for (size_t i = 0; i < words; i++)
         p[i] = 0;
 }
 
-static inline void MXR_IRAM_ALLOC_ATTR mxr_memcpy4(void *dst, const void *src, size_t bytes)
+static inline void MXR_IRAM_ATTR mxr_memcpy4(void *dst, const void *src, size_t bytes)
 {
-    uint32_t *d = (uint32_t *)dst;
-    const uint32_t *s = (const uint32_t *)src;
+    volatile uint32_t *d = (volatile uint32_t *)dst;
+    const volatile uint32_t *s = (const volatile uint32_t *)src;
     size_t words = bytes >> 2;
     for (size_t i = 0; i < words; i++)
         d[i] = s[i];
 }
 
 /* Перекрытие-безопасная пословная копия (IRAM-safe, без libc memmove). */
-static inline void MXR_IRAM_ALLOC_ATTR mxr_memmove4(void *dst, const void *src, size_t bytes)
+static inline void MXR_IRAM_ATTR mxr_memmove4(void *dst, const void *src, size_t bytes)
 {
-    uint32_t *d = (uint32_t *)dst;
-    const uint32_t *s = (const uint32_t *)src;
+    volatile uint32_t *d = (volatile uint32_t *)dst;
+    const volatile uint32_t *s = (const volatile uint32_t *)src;
     size_t words = bytes >> 2;
     if (d == s)
         return;
-    if (d < s)
+    if ((uintptr_t)d < (uintptr_t)s)
     {
         for (size_t i = 0; i < words; i++)
             d[i] = s[i];
@@ -209,6 +224,35 @@ static inline uint32_t mxr_percent_of(uint32_t total, uint32_t percent)
 {
     return (total / 100u) * percent + ((total % 100u) * percent) / 100u;
 }
+
+/* Largest-free APIs return the largest user payload, not the raw descriptor
+ * length. Raw gaps and descriptor limits are aligned to four bytes; canary
+ * bytes are part of the descriptor length when enabled. */
+static uint32_t MXR_IRAM_ATTR mxr_largest_user_block_from_internal(uint32_t bytes)
+{
+    bytes &= ~(uint32_t)MXR_ALIGN_MASK;
+    if (bytes <= (uint32_t)MXR_BLOCK_OVERHEAD)
+        return 0;
+    return bytes - (uint32_t)MXR_BLOCK_OVERHEAD;
+}
+
+static uint32_t MXR_IRAM_ATTR mxr_largest_user_block_in_gap(
+    uint32_t raw_gap,
+    uint32_t min_internal,
+    uint32_t class_max_internal,
+    uint32_t policy_max_internal)
+{
+    uint32_t internal = raw_gap & ~(uint32_t)MXR_ALIGN_MASK;
+    if (class_max_internal != MXR_REGION_MAX_UNLIMITED &&
+        internal > class_max_internal)
+        internal = class_max_internal & ~(uint32_t)MXR_ALIGN_MASK;
+    if (policy_max_internal != 0 && internal > policy_max_internal)
+        internal = policy_max_internal & ~(uint32_t)MXR_ALIGN_MASK;
+    if (internal < min_internal)
+        return 0;
+    return mxr_largest_user_block_from_internal(internal);
+}
+
 /* ================================================================
  *  Basic conversions
  * ================================================================ */
@@ -331,26 +375,17 @@ static bool MXR_IRAM_ATTR mxr_dram_desc_insert(
     if (s_dram_desc_count >= s_dram_desc_cap)
     {
 #if MXR_DESC_DYNAMIC_ACTIVE
-        if (!mxr_dram_table_grow())
-#endif
+        /* Descriptor growth consumes the top delta bytes. Preflight the
+         * candidate against the post-growth end before changing any state. */
+        if (!mxr_dram_table_can_grow_for(off_bytes, len_bytes) ||
+            !mxr_dram_table_grow())
         {
             s_stats.alloc_fail_table_full++;
             return false;
         }
-#if MXR_DESC_DYNAMIC_ACTIVE
-        if (s_dram_desc_count >= s_dram_desc_cap)
-        {
-            s_stats.alloc_fail_table_full++;
-            return false;
-        }
-        /* Рост уменьшает usable-хвост арены: ранее выполненная проверка
-         * off+len <= total была относительно СТАРОГО total — её нужно повторить
-         * против свежего s_arena_total_bytes. */
-        if ((uint32_t)off_bytes + len_bytes > s_arena_total_bytes)
-        {
-            s_stats.desc_insert_fail_bounds++;
-            return false;
-        }
+#else
+        s_stats.alloc_fail_table_full++;
+        return false;
 #endif
     }
 
@@ -455,7 +490,9 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
     int reg,
     uint32_t bytes,
     uint32_t *out_off,
-    uint32_t *out_alloc_bytes);
+    uint32_t *out_alloc_bytes,
+    uint32_t *out_largest,
+    bool *out_largest_exact);
 static uint32_t MXR_IRAM_ATTR mxr_iram_fb_region_largest_free(int reg);
 #endif /* CONFIG_MXR_IRAM_FALLBACK_ENABLED */
 
@@ -628,24 +665,17 @@ static bool MXR_IRAM_ATTR mxr_iram_desc_insert(
     if (s_iram_desc_count >= s_iram_desc_cap)
     {
 #if MXR_IRAM_DESC_DYNAMIC_ACTIVE
-        if (!mxr_iram_table_grow())
-#endif
+        /* IRAM descriptor growth also consumes the fallback tail. Preflight
+         * against the post-growth arena before mutating allocator state. */
+        if (!mxr_iram_table_can_grow_for(off_bytes, len_bytes) ||
+            !mxr_iram_table_grow())
         {
             s_stats.alloc_fail_table_full++;
             return false;
         }
-#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
-        if (s_iram_desc_count >= s_iram_desc_cap)
-        {
-            s_stats.alloc_fail_table_full++;
-            return false;
-        }
-        /* См. комментарий у DRAM: bounds-check повторяем против нового total */
-        if ((uint32_t)off_bytes + len_bytes > s_iram_total_bytes)
-        {
-            s_stats.desc_insert_fail_bounds++;
-            return false;
-        }
+#else
+        s_stats.alloc_fail_table_full++;
+        return false;
 #endif
     }
 
@@ -835,6 +865,8 @@ static uint32_t MXR_IRAM_ATTR mxr_region_largest_free_bytes(uint8_t region_index
     if (region_index >= s_region_count)
         return 0;
 
+    if (s_region[region_index].largest_cache_valid)
+        return s_region[region_index].largest_free_cache;
     uint32_t region_start = s_region[region_index].start_byte;
     uint32_t region_end = region_start + (uint32_t)s_region[region_index].total_bytes;
     uint32_t cur = region_start;
@@ -872,6 +904,8 @@ static uint32_t MXR_IRAM_ATTR mxr_region_largest_free_bytes(uint8_t region_index
         if (gap > largest)
             largest = gap;
     }
+    s_region[region_index].largest_free_cache = largest;
+    s_region[region_index].largest_cache_valid = 1;
     return largest;
 }
 
@@ -879,6 +913,18 @@ static inline void MXR_IRAM_INLINE_ATTR mxr_region_invalidate_cache(int region_i
 {
     if (region_index >= 0 && region_index < s_region_count)
         s_region[region_index].largest_cache_valid = 0;
+}
+
+static inline void MXR_IRAM_INLINE_ATTR mxr_update_dram_fb_min_free(void)
+{
+#ifdef CONFIG_MXR_USE_IRAM
+    const uint32_t cur = s_dram_free_bytes +
+        (s_iram_enabled ? s_iram_fb_free_bytes : 0u);
+#else
+    const uint32_t cur = s_dram_free_bytes;
+#endif
+    if (cur < s_dram_fb_min_free_bytes)
+        s_dram_fb_min_free_bytes = cur;
 }
 
 static inline void MXR_IRAM_INLINE_ATTR mxr_region_allocated(int region_index, uint32_t bytes)
@@ -907,6 +953,7 @@ static inline void MXR_IRAM_INLINE_ATTR mxr_region_allocated(int region_index, u
     if (s_stats.free_bytes < s_stats.min_free_bytes)
         s_stats.min_free_bytes = s_stats.free_bytes;
 
+    mxr_update_dram_fb_min_free();
     mxr_region_invalidate_cache(region_index);
 }
 
@@ -930,6 +977,7 @@ static inline void MXR_IRAM_INLINE_ATTR mxr_region_released(int region_index, ui
         s_stats.free_bytes = s_stats.total_bytes;
 
     mxr_region_invalidate_cache(region_index);
+    mxr_update_dram_fb_min_free();
 }
 
 /* ================================================================
@@ -1391,12 +1439,11 @@ mxr_canary_ok_block(const void *block_base, uint32_t len_bytes)
 static void MXR_IRAM_ATTR
 mxr_canary_report(uint32_t off_bytes, uint32_t len_bytes, bool is_iram)
 {
+    (void)off_bytes;
+    (void)len_bytes;
+    (void)is_iram;
+    /* Cache-off safe: report later through mxr_get_status()/mxr_dump(). */
     s_stats.canary_violations++;
-    ESP_EARLY_LOGE(TAG,
-                   "HEAP CANARY violation: %s off=%u len=%u (total=%u)",
-                   is_iram ? "IRAM" : "DRAM",
-                   (unsigned)off_bytes, (unsigned)len_bytes,
-                   (unsigned)s_stats.canary_violations);
 }
 
 #else /* !MXR_CANARY_ACTIVE */
@@ -1428,8 +1475,7 @@ mxr_dfd_push(uint32_t off_bytes, uint32_t len_bytes, uint8_t arena)
 {
     uint32_t len24 = (len_bytes > 0xFFFFFFu) ? 0xFFFFFFu : len_bytes;
     s_dfd_ring[s_dfd_pos].off = off_bytes;
-    s_dfd_ring[s_dfd_pos].len = len24;
-    s_dfd_ring[s_dfd_pos].arena = arena;
+    s_dfd_ring[s_dfd_pos].len_arena = (len24 & 0x00FFFFFFu) | ((uint32_t)arena << 24);
     s_dfd_pos = (uint16_t)((s_dfd_pos + 1) % (uint16_t)MXR_DFD_RING_SIZE);
     if (s_dfd_count < (uint16_t)MXR_DFD_RING_SIZE)
         s_dfd_count++;
@@ -1440,7 +1486,7 @@ mxr_dfd_contains(uint32_t off_bytes, uint8_t arena)
 {
     for (uint16_t i = 0; i < s_dfd_count; i++)
     {
-        if (s_dfd_ring[i].off == off_bytes && s_dfd_ring[i].arena == arena)
+        if (s_dfd_ring[i].off == off_bytes && ((s_dfd_ring[i].len_arena >> 24) & 0xFFu) == arena)
             return true;
     }
     return false;
@@ -1452,12 +1498,8 @@ mxr_dfd_classify(uint32_t off_bytes, uint8_t arena)
 {
     if (!mxr_dfd_contains(off_bytes, arena))
         return false;
+    /* No flash strings or logger calls while the allocator lock is held. */
     s_stats.double_free_detects++;
-    ESP_EARLY_LOGE(TAG,
-                   "DOUBLE FREE detected: %s off=%u (total=%u)",
-                   (arena == 2) ? "IRAM" : "DRAM",
-                   (unsigned)off_bytes,
-                   (unsigned)s_stats.double_free_detects);
     return true;
 }
 
@@ -1492,6 +1534,36 @@ mxr_dfd_classify(uint32_t off_bytes, uint8_t arena)
  *  региону — его total/free и глобальные счётчики двигаются согласованно.
  * ================================================================ */
 #if MXR_DESC_DYNAMIC_ACTIVE
+static bool MXR_IRAM_ATTR mxr_dram_table_can_grow_for(uint32_t off_bytes, uint32_t len_bytes)
+{
+    const uint32_t delta =
+        (uint32_t)MXR_DESC_CHUNK * (uint32_t)sizeof(mxr_desc_t);
+
+    if ((uint32_t)s_dram_desc_cap + (uint32_t)MXR_DESC_CHUNK >
+        (uint32_t)CONFIG_MXR_MAX_DESC)
+        return false;
+    if (s_region_count == 0 || s_arena_total_bytes < delta)
+        return false;
+
+    const uint32_t new_end = s_arena_total_bytes - delta;
+    if (s_dram_desc_count > 0)
+    {
+        const mxr_desc_t *last = &s_dram_desc[s_dram_desc_count - 1];
+        const uint32_t top_used = mxr_desc_off(last) + mxr_desc_len(last);
+        if (top_used > new_end)
+            return false;
+    }
+    else if ((uint32_t)s_region[s_region_count - 1].start_byte > new_end)
+    {
+        return false;
+    }
+
+    /* Candidate must still fit after metadata consumes delta. */
+    if (off_bytes > new_end || len_bytes > new_end - off_bytes)
+        return false;
+    return true;
+}
+
 static bool MXR_IRAM_ATTR mxr_dram_table_grow(void)
 {
     const uint32_t delta = (uint32_t)MXR_DESC_CHUNK * (uint32_t)sizeof(mxr_desc_t);
@@ -1547,12 +1619,13 @@ static bool MXR_IRAM_ATTR mxr_dram_table_grow(void)
         s_stats.free_bytes = 0;
     if (s_stats.free_bytes < s_stats.min_free_bytes)
         s_stats.min_free_bytes = s_stats.free_bytes;
+    mxr_update_dram_fb_min_free();
     if (s_stats.total_bytes >= (size_t)delta)
         s_stats.total_bytes -= (size_t)delta;
 
     /* записи таблицы вниз (dst < src — прямой проход безопасен) */
     mxr_memmove4(s_arena_base + new_off, s_dram_desc,
-                 (size_t)s_dram_desc_cap * sizeof(mxr_desc_t));
+                 (size_t)s_dram_desc_count * sizeof(mxr_desc_t));
     s_dram_desc = (mxr_desc_t *)(s_arena_base + new_off);
     s_dram_desc_cap = (uint16_t)(s_dram_desc_cap + MXR_DESC_CHUNK);
     s_stats.dram_desc_capacity = s_dram_desc_cap;
@@ -1566,7 +1639,7 @@ static bool MXR_IRAM_ATTR mxr_dram_table_grow(void)
 
 static void MXR_IRAM_ATTR mxr_dram_table_maybe_shrink(void)
 {
-    if ((uint32_t)s_dram_desc_cap <= (uint32_t)MXR_DESC_INIT)
+    if ((uint32_t)s_dram_desc_cap <= (uint32_t)MXR_DRAM_DESC_INIT)
         return;
     if ((uint32_t)s_dram_desc_cap - s_dram_desc_count < 2u * (uint32_t)MXR_DESC_CHUNK)
         return;
@@ -1579,7 +1652,7 @@ static void MXR_IRAM_ATTR mxr_dram_table_maybe_shrink(void)
 
     /* записи таблицы вверх (dst > src — обратный проход) */
     mxr_memmove4(s_arena_base + new_off, s_dram_desc,
-                 (size_t)((uint32_t)s_dram_desc_cap - MXR_DESC_CHUNK) * sizeof(mxr_desc_t));
+                 (size_t)s_dram_desc_count * sizeof(mxr_desc_t));
     s_dram_desc = (mxr_desc_t *)(s_arena_base + new_off);
     s_dram_desc_cap = (uint16_t)(s_dram_desc_cap - MXR_DESC_CHUNK);
     s_stats.dram_desc_capacity = s_dram_desc_cap;
@@ -1609,6 +1682,36 @@ static void MXR_IRAM_ATTR mxr_dram_table_maybe_shrink(void)
 #endif /* MXR_DESC_DYNAMIC_ACTIVE */
 
 #if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+static bool MXR_IRAM_ATTR mxr_iram_table_can_grow_for(uint32_t off_bytes, uint32_t len_bytes)
+{
+    const uint32_t delta =
+        (uint32_t)MXR_DESC_CHUNK * (uint32_t)sizeof(mxr_desc_t);
+
+    if ((uint32_t)s_iram_desc_cap + (uint32_t)MXR_DESC_CHUNK >
+        (uint32_t)CONFIG_MXR_IRAM_MAX_DESC)
+        return false;
+    if (s_iram_fb_region_count == 0 || s_iram_total_bytes < delta)
+        return false;
+
+    const uint32_t new_end = s_iram_total_bytes - delta;
+    if (s_iram_desc_count > 0)
+    {
+        const mxr_desc_t *last = &s_iram_desc[s_iram_desc_count - 1];
+        const uint32_t top_used = mxr_desc_off(last) + mxr_desc_len(last);
+        if (top_used > new_end)
+            return false;
+    }
+    else if ((uint32_t)s_iram_fb_region[s_iram_fb_region_count - 1].start_byte > new_end)
+    {
+        return false;
+    }
+
+    if (off_bytes > new_end || len_bytes > new_end - off_bytes)
+        return false;
+
+    return true;
+}
+
 static bool MXR_IRAM_ATTR mxr_iram_table_grow(void)
 {
     const uint32_t delta = (uint32_t)MXR_DESC_CHUNK * (uint32_t)sizeof(mxr_desc_t);
@@ -1633,7 +1736,8 @@ static bool MXR_IRAM_ATTR mxr_iram_table_grow(void)
     }
 
     uint32_t arena_end = s_iram_total_bytes;
-    if ((uint32_t)s_iram_fb_region[r].total_bytes < delta)
+    if ((uint32_t)s_iram_fb_region[r].total_bytes < delta ||
+        s_iram_fb_zone_total < delta)
         return false;
     if (arena_end < delta || top_used > arena_end - delta)
         return false;
@@ -1641,11 +1745,16 @@ static bool MXR_IRAM_ATTR mxr_iram_table_grow(void)
     uint32_t new_off = arena_end - delta;
 
     s_iram_total_bytes = new_off;
+    s_iram_fb_zone_total -= delta;
     s_iram_fb_region[r].total_bytes -= delta;
     if ((uint32_t)s_iram_fb_region[r].free_bytes >= delta)
         s_iram_fb_region[r].free_bytes -= delta;
     else
         s_iram_fb_region[r].free_bytes = 0;
+    if (s_iram_fb_free_bytes >= delta)
+        s_iram_fb_free_bytes -= delta;
+    else
+        s_iram_fb_free_bytes = 0;
     if ((uint32_t)s_iram_fb_region[r].free_bytes < s_iram_fb_region[r].min_free_bytes)
         s_iram_fb_region[r].min_free_bytes = s_iram_fb_region[r].free_bytes;
     s_iram_fb_region[r].largest_cache_valid = 0;
@@ -1662,11 +1771,12 @@ static bool MXR_IRAM_ATTR mxr_iram_table_grow(void)
         s_stats.free_bytes = 0;
     if (s_stats.free_bytes < s_stats.min_free_bytes)
         s_stats.min_free_bytes = s_stats.free_bytes;
+    mxr_update_dram_fb_min_free();
     if (s_stats.total_bytes >= (size_t)delta)
         s_stats.total_bytes -= (size_t)delta;
 
     mxr_memmove4(s_iram_base + new_off, s_iram_desc,
-                 (size_t)s_iram_desc_cap * sizeof(mxr_desc_t));
+                 (size_t)s_iram_desc_count * sizeof(mxr_desc_t));
     s_iram_desc = (mxr_desc_t *)(s_iram_base + new_off);
     s_iram_desc_cap = (uint16_t)(s_iram_desc_cap + MXR_DESC_CHUNK);
     s_stats.iram_desc_capacity = s_iram_desc_cap;
@@ -1677,7 +1787,7 @@ static bool MXR_IRAM_ATTR mxr_iram_table_grow(void)
 
 static void MXR_IRAM_ATTR mxr_iram_table_maybe_shrink(void)
 {
-    if ((uint32_t)s_iram_desc_cap <= (uint32_t)MXR_DESC_INIT)
+    if ((uint32_t)s_iram_desc_cap <= (uint32_t)MXR_IRAM_DESC_INIT)
         return;
     if ((uint32_t)s_iram_desc_cap - s_iram_desc_count < 2u * (uint32_t)MXR_DESC_CHUNK)
         return;
@@ -1690,12 +1800,13 @@ static void MXR_IRAM_ATTR mxr_iram_table_maybe_shrink(void)
 
     /* записи таблицы вверх (dst > src — обратный проход) */
     mxr_memmove4(s_iram_base + new_off, s_iram_desc,
-                 (size_t)((uint32_t)s_iram_desc_cap - MXR_DESC_CHUNK) * sizeof(mxr_desc_t));
+                 (size_t)s_iram_desc_count * sizeof(mxr_desc_t));
     s_iram_desc = (mxr_desc_t *)(s_iram_base + new_off);
     s_iram_desc_cap = (uint16_t)(s_iram_desc_cap - MXR_DESC_CHUNK);
     s_stats.iram_desc_capacity = s_iram_desc_cap;
 
     s_iram_total_bytes = new_off;
+    s_iram_fb_zone_total += delta;
     s_iram_fb_region[r].total_bytes += delta;
     s_iram_fb_region[r].free_bytes += delta;
     if ((uint32_t)s_iram_fb_region[r].free_bytes > (uint32_t)s_iram_fb_region[r].total_bytes)
@@ -1881,119 +1992,12 @@ static bool MXR_IRAM_ATTR mxr_find_best_free(
 #if defined(CONFIG_MXR_CROSS_REGION_FALLBACK) && \
     defined(CONFIG_MXR_DRAM_CROSS_ENABLED)
 static bool MXR_IRAM_ATTR mxr_find_free_and_largest(
-    int region_index,
-    uint32_t bytes,
-    uint32_t *out_off,
-    uint32_t *out_largest,
-    uint32_t *out_alloc_bytes)
+    int region_index, uint32_t bytes, uint32_t *out_off,
+    uint32_t *out_largest, uint32_t *out_alloc_bytes,
+    bool *out_largest_exact)
 {
-    uint32_t region_start = s_region[region_index].start_byte;
-    uint32_t region_end = region_start + (uint32_t)s_region[region_index].total_bytes;
-    uint32_t cur = region_start;
-    uint32_t largest = 0;
-    uint32_t best_off = 0;
-    uint32_t best_gap = UINT32_MAX;
-    bool found = false;
-    uint16_t start_idx = 0;
-#if MXR_DESC_BINARY_SEARCH_ACTIVE
-    start_idx = mxr_dram_desc_first_after(region_start);
-#endif
-#if MXR_EARLY_EXIT_ACTIVE
-    uint32_t waste_limit = bytes >> MXR_BEST_FIT_WASTE_SHIFT;
-    if (waste_limit < MXR_ALIGN_SIZE)
-        waste_limit = MXR_ALIGN_SIZE;
-#else
-    /* Строгий best-fit: ранний выход только при точном совпадении
-     * (waste == 0) — лучше найти невозможно. */
-    uint32_t waste_limit = 0;
-#endif
-
-    for (uint16_t i = start_idx; i < s_dram_desc_count; i++)
-    {
-        uint32_t off = mxr_desc_off(&s_dram_desc[i]);
-        uint32_t len = mxr_desc_len(&s_dram_desc[i]);
-        uint32_t block_end = off + (uint32_t)len;
-
-        if (block_end <= region_start)
-            continue;
-        if (off >= region_end)
-            break;
-
-        if (off > cur)
-        {
-            uint32_t gap = (uint32_t)(off - cur);
-            if (gap > largest)
-                largest = gap;
-            if (gap >= bytes)
-            {
-                uint32_t waste = gap - bytes;
-                if (!found && (waste <= waste_limit || mxr_bgg_relaxed(gap, bytes, waste_limit)))
-                {
-                    /* Early-exit */
-                    best_off = cur;
-                    best_gap = gap;
-                    found = true;
-                    /* Не прерываем — нужно досчитать largest */
-                }
-                else if (!found || gap < best_gap || (gap == best_gap && cur < best_off))
-                {
-                    best_off = cur;
-                    best_gap = gap;
-                    found = true;
-                }
-            }
-        }
-        if (block_end > cur)
-            cur = block_end;
-        if (cur >= region_end)
-            break;
-    }
-
-    if (region_end > cur)
-    {
-        uint32_t gap = (uint32_t)(region_end - cur);
-        if (gap > largest)
-            largest = gap;
-        if (gap >= bytes)
-        {
-            uint32_t waste = gap - bytes;
-            if (!found && (waste <= waste_limit || mxr_bgg_relaxed(gap, bytes, waste_limit)))
-            {
-                best_off = cur;
-                best_gap = gap;
-                found = true;
-            }
-            else if (!found || gap < best_gap || (gap == best_gap && cur < best_off))
-            {
-                best_off = cur;
-                best_gap = gap;
-                found = true;
-            }
-        }
-    }
-
-    if (out_largest)
-        *out_largest = largest;
-
-    if (found)
-    {
-        *out_off = best_off;
-        uint32_t waste = best_gap - bytes;
-        /* ===== ИСПРАВЛЕНО: ограничение max_bytes + счётчик ===== */
-        uint32_t max_allowed = s_region[region_index].max_bytes;
-        if (MXR_IS_SLIVER(waste) &&
-            (max_allowed == MXR_REGION_MAX_UNLIMITED || best_gap <= max_allowed))
-        {
-            *out_alloc_bytes = best_gap;
-            s_stats.anti_sliver_expansions++; /* ДОБАВЛЕНО */
-        }
-        else
-        {
-            *out_alloc_bytes = bytes;
-        }
-        /* ========================================================= */
-    }
-    return found;
+    return mxr_find_best_free(region_index, bytes, out_off, out_alloc_bytes,
+                              out_largest, out_largest_exact);
 }
 
 #endif
@@ -2079,27 +2083,45 @@ static bool MXR_IRAM_ATTR mxr_try_alloc_region(
  *  FIX(3.3): BEST-FIT с early-exit внутри одного fb-региона.
  *  Раньше: last-fit first-match (первый gap с конца).
  *  Теперь: наименьший подходящий gap; при равных gap предпочтение
- *  более высокому адресу (дальше от EXEC-зоны). Блок размещается
- *  у ВЕРХНЕЙ границы gap, чтобы низ оставался свободным.
+ *  более высокому адресу (дальше от EXEC-зоны). В dynamic IRAM mode
+ *  allocation from the physical tail is placed at the LOWER edge of that
+ *  gap so the tail remains available for future descriptor-table growth.
+ *  Non-tail gaps retain the normal upper-edge placement policy.
  * ================================================================ */
 static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
     int reg,
     uint32_t bytes,
     uint32_t *out_off,
-    uint32_t *out_alloc_bytes)
+    uint32_t *out_alloc_bytes,
+    uint32_t *out_largest,
+    bool *out_largest_exact)
 {
+    *out_largest = 0;
+    *out_largest_exact = false;
     if (reg < 0 || reg >= (int)s_iram_fb_region_count)
         return false;
     uint32_t reg_start = s_iram_fb_region[reg].start_byte;
     uint32_t reg_end = mxr_iram_fb_region_end(reg);
     uint32_t max_allowed = s_iram_fb_region[reg].max_bytes;
+    /* Limit the descriptor size AFTER anti-sliver, including canaries. */
+    if (CONFIG_MXR_IRAM_FALLBACK_MAX_BYTES != 0 &&
+        (max_allowed == MXR_REGION_MAX_UNLIMITED ||
+         max_allowed > (uint32_t)CONFIG_MXR_IRAM_FALLBACK_MAX_BYTES))
+        max_allowed = (uint32_t)CONFIG_MXR_IRAM_FALLBACK_MAX_BYTES;
     if (s_iram_fb_region[reg].free_bytes < bytes)
         return false;
 
+    uint32_t largest = 0;
     uint32_t cur = reg_start;
     uint32_t best_off = 0;
     uint32_t best_gap = UINT32_MAX;
     bool found = false;
+    bool preserve_tail_for_growth = false;
+#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+    if (reg == (int)s_iram_fb_region_count - 1 &&
+        mxr_iram_table_can_grow_for(0, 0))
+        preserve_tail_for_growth = true;
+#endif
     uint16_t start_idx = 0;
 #if MXR_DESC_BINARY_SEARCH_ACTIVE
     start_idx = mxr_iram_desc_first_after(reg_start);
@@ -2124,6 +2146,7 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
         if (off > cur)
         {
             uint32_t gap = (uint32_t)(off - cur);
+            if (gap > largest) largest = gap;
             if (gap >= bytes)
             {
                 uint32_t waste = gap - bytes;
@@ -2143,6 +2166,7 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
                         *out_alloc_bytes = bytes;
                     }
                     s_stats.best_fit_early_exits++;
+                    *out_largest = largest;
                     return true;
                 }
                 /* меньший gap лучше; при равенстве — выше адрес */
@@ -2164,12 +2188,20 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
     if (reg_end > cur)
     {
         uint32_t gap = (uint32_t)(reg_end - cur);
+        if (gap > largest) largest = gap;
         if (gap >= bytes)
         {
             uint32_t waste = gap - bytes;
             if (waste <= waste_limit)
             {
-                if (MXR_IS_SLIVER(waste) &&
+                if (preserve_tail_for_growth)
+                {
+                    /* Keep the physical IRAM tail available for the next
+                     * descriptor-table growth. */
+                    *out_off = cur;
+                    *out_alloc_bytes = bytes;
+                }
+                else if (MXR_IS_SLIVER(waste) &&
                     (max_allowed == MXR_REGION_MAX_UNLIMITED || gap <= max_allowed))
                 {
                     *out_off = cur;
@@ -2182,6 +2214,7 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
                     *out_alloc_bytes = bytes;
                 }
                 s_stats.best_fit_early_exits++;
+                *out_largest = largest;
                 return true;
             }
             if (gap < best_gap || (gap == best_gap && cur > best_off))
@@ -2193,10 +2226,20 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
         }
     }
 
+    *out_largest = largest;
+    *out_largest_exact = true;
     if (!found)
         return false;
 
     uint32_t waste = best_gap - bytes;
+    if (preserve_tail_for_growth &&
+        best_off + best_gap == reg_end)
+    {
+        /* The tail is the backing store for future descriptor growth. */
+        *out_off = best_off;
+        *out_alloc_bytes = bytes;
+        return true;
+    }
     if (MXR_IS_SLIVER(waste) &&
         (max_allowed == MXR_REGION_MAX_UNLIMITED || best_gap <= max_allowed))
     {
@@ -2218,7 +2261,8 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_in_region(
     defined(CONFIG_MXR_IRAM_FALLBACK_ENABLED)
 /* ================================================================
  *  FIX(3.3): IRAM fb search + largest, BEST-FIT (полный проход,
- *  т.к. largest всё равно нужно досчитать).
+ *  т.к. largest всё равно нужно досчитать). В dynamic mode the physical
+ *  tail is kept free for subsequent descriptor growth.
  * ================================================================ */
 static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_and_largest(
     int reg,
@@ -2232,6 +2276,11 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_and_largest(
     uint32_t reg_start = s_iram_fb_region[reg].start_byte;
     uint32_t reg_end = mxr_iram_fb_region_end(reg);
     uint32_t max_allowed = s_iram_fb_region[reg].max_bytes;
+    /* Limit the descriptor size AFTER anti-sliver, including canaries. */
+    if (CONFIG_MXR_IRAM_FALLBACK_MAX_BYTES != 0 &&
+        (max_allowed == MXR_REGION_MAX_UNLIMITED ||
+         max_allowed > (uint32_t)CONFIG_MXR_IRAM_FALLBACK_MAX_BYTES))
+        max_allowed = (uint32_t)CONFIG_MXR_IRAM_FALLBACK_MAX_BYTES;
     if (s_iram_fb_region[reg].free_bytes < bytes)
         return false;
 
@@ -2240,6 +2289,12 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_and_largest(
     uint32_t best_off = 0;
     uint32_t best_gap = UINT32_MAX;
     bool found = false;
+    bool preserve_tail_for_growth = false;
+#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+    if (reg == (int)s_iram_fb_region_count - 1 &&
+        mxr_iram_table_can_grow_for(0, 0))
+        preserve_tail_for_growth = true;
+#endif
     uint16_t start_idx = 0;
 #if MXR_DESC_BINARY_SEARCH_ACTIVE
     start_idx = mxr_iram_desc_first_after(reg_start);
@@ -2296,6 +2351,13 @@ static bool MXR_IRAM_ATTR mxr_iram_fb_find_free_and_largest(
         return false;
 
     uint32_t waste = best_gap - bytes;
+    if (preserve_tail_for_growth &&
+        best_off + best_gap == reg_end)
+    {
+        *out_off = best_off;
+        *out_alloc_bytes = bytes;
+        return true;
+    }
     if (MXR_IS_SLIVER(waste) &&
         (max_allowed == MXR_REGION_MAX_UNLIMITED || best_gap <= max_allowed))
     {
@@ -2370,33 +2432,6 @@ static uint32_t MXR_IRAM_ATTR mxr_iram_exec_largest_free(void)
         if (gap > largest)
             largest = gap;
     }
-
-    return largest;
-}
-
-static uint32_t MXR_IRAM_ATTR mxr_iram_largest_free_zone_aware(void)
-{
-    if (!s_iram_enabled)
-        return 0;
-
-    uint32_t largest = mxr_iram_exec_largest_free();
-
-#ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
-
-    for (uint8_t i = 0; i < s_iram_fb_region_count; i++)
-    {
-        uint32_t lr = mxr_iram_fb_region_largest_free((int)i);
-
-        if (s_iram_fb_region[i].max_bytes != MXR_REGION_MAX_UNLIMITED &&
-            lr > (uint32_t)s_iram_fb_region[i].max_bytes)
-        {
-            lr = (uint32_t)s_iram_fb_region[i].max_bytes;
-        }
-
-        if (lr > largest)
-            largest = lr;
-    }
-#endif
 
     return largest;
 }
@@ -2483,6 +2518,8 @@ static uint32_t MXR_IRAM_ATTR mxr_iram_fb_region_largest_free(int reg)
     if (reg < 0 || reg >= (int)s_iram_fb_region_count)
         return 0;
 
+    if (s_iram_fb_region[reg].largest_cache_valid)
+        return s_iram_fb_region[reg].largest_free_cache;
     uint32_t reg_start = s_iram_fb_region[reg].start_byte;
     uint32_t reg_end = mxr_iram_fb_region_end(reg);
     uint32_t cur = reg_start;
@@ -2520,6 +2557,8 @@ static uint32_t MXR_IRAM_ATTR mxr_iram_fb_region_largest_free(int reg)
         if (gap > largest)
             largest = gap;
     }
+    s_iram_fb_region[reg].largest_free_cache = largest;
+    s_iram_fb_region[reg].largest_cache_valid = 1;
     return largest;
 }
 
@@ -2532,6 +2571,10 @@ static inline void MXR_IRAM_INLINE_ATTR mxr_iram_fb_region_allocated(int reg, ui
         s_iram_fb_region[reg].free_bytes -= bytes;
     else
         s_iram_fb_region[reg].free_bytes = 0;
+    if (s_iram_fb_free_bytes >= bytes)
+        s_iram_fb_free_bytes -= bytes;
+    else
+        s_iram_fb_free_bytes = 0;
     if (s_iram_fb_region[reg].free_bytes < s_iram_fb_region[reg].min_free_bytes)
         s_iram_fb_region[reg].min_free_bytes = s_iram_fb_region[reg].free_bytes;
     if (count_block)
@@ -2548,6 +2591,10 @@ static inline void MXR_IRAM_INLINE_ATTR mxr_iram_fb_region_released(int reg, uin
     if (nf > s_iram_fb_region[reg].total_bytes)
         nf = s_iram_fb_region[reg].total_bytes;
     s_iram_fb_region[reg].free_bytes = nf;
+    uint32_t zone_nf = s_iram_fb_free_bytes + bytes;
+    if (zone_nf > s_iram_fb_zone_total)
+        zone_nf = s_iram_fb_zone_total;
+    s_iram_fb_free_bytes = zone_nf;
     if (count_block && s_iram_fb_region[reg].alloc_count > 0)
         s_iram_fb_region[reg].alloc_count--;
     mxr_iram_fb_region_invalidate_cache(reg);
@@ -2590,7 +2637,10 @@ static inline void MXR_IRAM_INLINE_ATTR mxr_iram_allocated(uint32_t off_bytes,
     }
 #ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
     else
+    {
         mxr_iram_fb_region_allocated(mxr_iram_fb_region_by_off(off_bytes), bytes, count_block);
+        mxr_update_dram_fb_min_free();
+    }
 #endif
 }
 
@@ -2617,7 +2667,10 @@ static inline void MXR_IRAM_INLINE_ATTR mxr_iram_released(uint32_t off_bytes,
     }
 #ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
     else
+    {
         mxr_iram_fb_region_released(mxr_iram_fb_region_by_off(off_bytes), bytes, count_block);
+        mxr_update_dram_fb_min_free();
+    }
 #endif
 }
 
@@ -2781,13 +2834,19 @@ static bool mxr_init_iram_fb_regions(void)
         return true; /* no fallback zone (all IRAM reserved for EXEC) */
 
     mxr_region_cfg_t cfg[MXR_IRAM_FB_REGION_COUNT];
-    uint8_t total = mxr_parse_region_config(
+    int16_t parsed = mxr_parse_region_config(
         CONFIG_MXR_IRAM_FALLBACK_REGION_CONFIG,
         cfg,
         MXR_IRAM_FB_REGION_COUNT);
+    if (parsed < 0)
+    {
+        ESP_EARLY_LOGE(TAG, "invalid IRAM fallback region config '%s'",
+                       CONFIG_MXR_IRAM_FALLBACK_REGION_CONFIG);
+        return false;
+    }
 
     /* Empty config -> one flat fallback region */
-    if (total == 0)
+    if (parsed == 0)
     {
         s_iram_fb_region_count = 1;
         s_iram_fb_region[0].caps = (mxr_caps_t)MXR_IRAM_FB_CAPS_DEFAULT;
@@ -2803,6 +2862,8 @@ static bool mxr_init_iram_fb_regions(void)
         MXR_REGION_HINT_RESET(&s_iram_fb_region[0]);
         return true;
     }
+
+    uint8_t total = (uint8_t)parsed;
 
     /* Validate percent sum */
     uint16_t percent_sum = 0;
@@ -2831,6 +2892,13 @@ static bool mxr_init_iram_fb_regions(void)
         if (b < MXR_ALIGN_SIZE)
             b = MXR_ALIGN_SIZE;
         cfg[i].min_bytes = (mxr_class_t)b;
+    }
+
+    if ((uint32_t)cfg[0].min_bytes > MXR_ALIGN_SIZE)
+    {
+        ESP_EARLY_LOGE(TAG, "first IRAM fb boundary must be <= %u",
+                       (unsigned)MXR_ALIGN_SIZE);
+        return false;
     }
 
     /* Boundaries must be strictly increasing */
@@ -2938,6 +3006,7 @@ static void mxr_init_iram(void)
     s_iram_fallback_allocs = 0;
     s_iram_fb_zone_start = 0;
     s_iram_fb_zone_total = 0;
+    s_iram_fb_free_bytes = 0;
     s_iram_fb_region_count = 0;
     s_iram_exec_free_bytes = 0;
     s_iram_exec_min_free_bytes = 0;
@@ -2965,7 +3034,7 @@ static void mxr_init_iram(void)
     /* Хвост IRAM-арены под таблицу дескрипторов */
     {
         uint32_t idesc_bytes =
-            (uint32_t)MXR_DESC_INIT * (uint32_t)sizeof(mxr_desc_t);
+            (uint32_t)MXR_IRAM_DESC_INIT * (uint32_t)sizeof(mxr_desc_t);
         if ((uint32_t)bytes <= idesc_bytes + 256u)
         {
             ESP_EARLY_LOGE(TAG, "IRAM arena too small for dynamic desc table, IRAM heap disabled");
@@ -2973,7 +3042,7 @@ static void mxr_init_iram(void)
         }
         bytes -= idesc_bytes;
         s_iram_desc = (mxr_desc_t *)(start + bytes);
-        s_iram_desc_cap = MXR_DESC_INIT;
+        s_iram_desc_cap = MXR_IRAM_DESC_INIT;
     }
 #endif
 
@@ -3029,6 +3098,8 @@ static void mxr_init_iram(void)
     }
 #endif
 #endif /* CONFIG_MXR_IRAM_FALLBACK_ENABLED */
+
+    s_iram_fb_free_bytes = s_iram_fb_zone_total;
 
     /* EXEC-зона = [0, fb_zone_start) */
     s_iram_exec_free_bytes = s_iram_fb_zone_start;
@@ -3151,11 +3222,11 @@ static void *MXR_IRAM_ATTR mxr_try_cross_region(
         uint32_t off_bytes = 0;
         uint32_t largest = 0;
         uint32_t alloc_bytes = bytes;
+        bool largest_exact = false;
         bool found = mxr_find_free_and_largest((int)i, bytes,
-                                               &off_bytes, &largest,
-                                               &alloc_bytes);
+            &off_bytes, &largest, &alloc_bytes, &largest_exact);
         s_region[i].largest_free_cache = largest;
-        s_region[i].largest_cache_valid = 1;
+        s_region[i].largest_cache_valid = largest_exact;
         if (!found)
         {
             s_stats.cross_region_skip_fragmented++;
@@ -3210,14 +3281,13 @@ static void *MXR_IRAM_ATTR mxr_try_iram_fallback(uint32_t bytes, uint32_t caps)
         }
         else
         {
+            uint32_t largest = 0;
+            bool largest_exact = false;
             found = mxr_iram_fb_find_free_in_region(fb_reg, bytes,
-                                                    &off_bytes, &alloc_bytes);
-            if (!found)
-            {
-                uint32_t largest = mxr_iram_fb_region_largest_free(fb_reg);
+                &off_bytes, &alloc_bytes, &largest, &largest_exact);
+            s_iram_fb_region[fb_reg].largest_cache_valid = largest_exact;
+            if (largest_exact)
                 s_iram_fb_region[fb_reg].largest_free_cache = largest;
-                s_iram_fb_region[fb_reg].largest_cache_valid = 1;
-            }
         }
         if (found)
         {
@@ -3313,7 +3383,7 @@ static void *MXR_IRAM_ATTR mxr_malloc_caps_locked(size_t size, uint32_t caps)
     /* EXEC allocations go only to IRAM */
     if (caps & MALLOC_CAP_EXEC)
     {
-        if ((caps & ~(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) != 0)
+        if ((caps & ~((uint32_t)MALLOC_CAP_EXEC | (uint32_t)MALLOC_CAP_32BIT | (uint32_t)MALLOC_CAP_INTERNAL)) != 0)
         {
             s_stats.alloc_fail_no_memory++;
             return NULL;
@@ -3566,7 +3636,7 @@ void MXR_IRAM_ATTR mxr_free(void *ptr)
 
 void *MXR_IRAM_ATTR mxr_malloc(size_t size)
 {
-    return mxr_malloc_caps(size, MALLOC_CAP_32BIT);
+    return mxr_malloc_caps(size, MXR_DEFAULT_CAPS);
 }
 
 void *MXR_IRAM_ALLOC_ATTR mxr_calloc_caps(size_t count, size_t size, uint32_t caps)
@@ -3591,7 +3661,7 @@ void *MXR_IRAM_ALLOC_ATTR mxr_calloc_caps(size_t count, size_t size, uint32_t ca
 
 void *MXR_IRAM_ALLOC_ATTR mxr_calloc(size_t count, size_t size)
 {
-    return mxr_calloc_caps(count, size, MALLOC_CAP_32BIT);
+    return mxr_calloc_caps(count, size, MXR_DEFAULT_CAPS);
 }
 
 void *MXR_IRAM_ALLOC_ATTR mxr_zalloc_caps(size_t size, uint32_t caps)
@@ -3607,7 +3677,7 @@ void *MXR_IRAM_ALLOC_ATTR mxr_zalloc_caps(size_t size, uint32_t caps)
 
 void *MXR_IRAM_ALLOC_ATTR mxr_zalloc(size_t size)
 {
-    return mxr_zalloc_caps(size, MALLOC_CAP_32BIT);
+    return mxr_zalloc_caps(size, MXR_DEFAULT_CAPS);
 }
 
 /* ================================================================
@@ -3639,14 +3709,18 @@ void *MXR_IRAM_ALLOC_ATTR mxr_realloc_caps(void *ptr, size_t newsize, uint32_t c
 
     if (newsize > MXR_MAX_LEN_BYTES)
     {
+        mxr_lock();
         s_stats.alloc_fail_no_memory++;
+        mxr_unlock();
         return NULL;
     }
 
     newsize = mxr_align4(newsize);
     if (newsize == 0 || newsize > MXR_MAX_LEN_BYTES - MXR_BLOCK_OVERHEAD)
     {
+        mxr_lock();
         s_stats.alloc_fail_no_memory++;
+        mxr_unlock();
         return NULL;
     }
 
@@ -3785,7 +3859,12 @@ void *MXR_IRAM_ALLOC_ATTR mxr_realloc_caps(void *ptr, size_t newsize, uint32_t c
             mxr_unlock();
             return NULL;
         }
+        /* Both payloads stay allocated. Other tasks may move descriptor tables,
+         * but cannot relocate these payloads. Re-find old by pointer on free.
+         * As with libc realloc, caller must exclude concurrent use/free of ptr. */
+        mxr_unlock();
         mxr_memcpy4(new_ptr, ptr, (size_t)copy_bytes);
+        mxr_lock();
         mxr_free_locked(ptr);
         mxr_unlock();
         return new_ptr;
@@ -3823,7 +3902,7 @@ void *MXR_IRAM_ALLOC_ATTR mxr_realloc_caps(void *ptr, size_t newsize, uint32_t c
         {
             in_place_allowed =
                 old_exec &&
-                ((caps & ~(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) == 0);
+                ((caps & ~((uint32_t)MALLOC_CAP_EXEC | (uint32_t)MALLOC_CAP_32BIT | (uint32_t)MALLOC_CAP_INTERNAL)) == 0);
         }
         else if (!old_exec)
         {
@@ -3962,7 +4041,12 @@ void *MXR_IRAM_ALLOC_ATTR mxr_realloc_caps(void *ptr, size_t newsize, uint32_t c
             mxr_unlock();
             return NULL;
         }
+        /* Both payloads stay allocated. Other tasks may move descriptor tables,
+         * but cannot relocate these payloads. Re-find old by pointer on free.
+         * As with libc realloc, caller must exclude concurrent use/free of ptr. */
+        mxr_unlock();
         mxr_memcpy4(new_ptr, ptr, (size_t)copy_bytes);
+        mxr_lock();
         mxr_free_locked(ptr);
         mxr_unlock();
         return new_ptr;
@@ -3975,7 +4059,7 @@ void *MXR_IRAM_ALLOC_ATTR mxr_realloc_caps(void *ptr, size_t newsize, uint32_t c
 
 void *MXR_IRAM_ALLOC_ATTR mxr_realloc(void *ptr, size_t newsize)
 {
-    return mxr_realloc_caps(ptr, newsize, MALLOC_CAP_32BIT);
+    return mxr_realloc_caps(ptr, newsize, MXR_DEFAULT_CAPS);
 }
 
 /* ================================================================
@@ -4138,7 +4222,7 @@ static bool mxr_init_regions_exact(
  *  Region config parser: "4-20%,56-1%,128-34%"
  *  (shared by DRAM and IRAM fallback)
  * ================================================================ */
-static uint8_t mxr_parse_region_config(
+static int16_t mxr_parse_region_config(
     const char *s,
     mxr_region_cfg_t *out,
     uint8_t max_count)
@@ -4146,77 +4230,104 @@ static uint8_t mxr_parse_region_config(
     const char *p = s;
     uint8_t count = 0;
 
-    while (count < max_count && p && *p)
-    {
-        while (*p == ' ' || *p == '\t' || *p == ',')
-            p++;
-        if (*p == '\0')
-            break;
+    if (!p)
+        return 0;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p == '\0')
+        return 0; /* empty config intentionally means one flat region */
+    if (!out || max_count == 0)
+        return -1;
 
-        /* --- min_bytes --- */
+    for (;;)
+    {
+        if (count >= max_count)
+            return -1;
+
         uint32_t min_b = 0;
         bool has_digit = false;
         while (*p >= '0' && *p <= '9')
         {
-            min_b = min_b * 10 + (uint32_t)(*p - '0');
+            uint32_t digit = (uint32_t)(*p - '0');
+            if (min_b > (0x7FFFFFFFu - digit) / 10u)
+                return -1;
+            min_b = min_b * 10u + digit;
             has_digit = true;
             p++;
-            if (min_b > 0x7FFFFFFF)
-                return count;
         }
-        if (!has_digit)
-            break;
-        if (*p != '-')
-            break;
+        if (!has_digit || *p != '-')
+            return -1;
         p++;
 
-#ifdef CONFIG_MXR_COMPACT_TYPES
-        if (min_b > 0xFFFF)
+#if defined(CONFIG_MXR_COMPACT_TYPES) && !MXR_STATE_PLACED_IN_IRAM
+        /* The stored value is the 4-byte-aligned boundary. A textual
+         * boundary of 65534 or 65535 becomes 65536 and would wrap in the
+         * compact uint16_t representation. */
+        uint32_t aligned_min_b = (uint32_t)mxr_align4((size_t)min_b);
+        if (aligned_min_b < MXR_ALIGN_SIZE)
+            aligned_min_b = MXR_ALIGN_SIZE;
+        if (aligned_min_b > 0xFFFFu)
         {
-            ESP_EARLY_LOGE(TAG, "boundary %u exceeds compact max 65535",
-                           (unsigned)min_b);
-            return count;
+            ESP_EARLY_LOGE(TAG,
+                           "aligned boundary %u exceeds compact max 65535",
+                           (unsigned)aligned_min_b);
+            return -1;
         }
 #endif
 
-        /* --- percent --- */
         uint32_t pct = 0;
         has_digit = false;
         while (*p >= '0' && *p <= '9')
         {
-            pct = pct * 10 + (uint32_t)(*p - '0');
+            uint32_t digit = (uint32_t)(*p - '0');
+            if (pct > (100u - digit) / 10u)
+                return -1;
+            pct = pct * 10u + digit;
             has_digit = true;
             p++;
-            if (pct > 100)
-                return count;
         }
-        if (!has_digit)
-            break;
-        if (*p == '%')
-            p++;
+        if (!has_digit || *p != '%')
+            return -1;
+        p++;
 
         out[count].min_bytes = (mxr_class_t)min_b;
         out[count].percent = (uint8_t)pct;
         out[count].max_bytes = MXR_REGION_MAX_UNLIMITED;
         count++;
-    }
 
-    return count;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0')
+            return (int16_t)count;
+        if (*p != ',')
+            return -1;
+        p++;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0' || *p == ',')
+            return -1;
+    }
 }
 
 static bool mxr_init_regions_kconfig(void)
 {
     mxr_region_cfg_t cfg[MXR_ACTIVE_TOTAL_REGIONS];
-    uint8_t total = mxr_parse_region_config(
+    int16_t parsed = mxr_parse_region_config(
         CONFIG_MXR_REGION_CONFIG, cfg, MXR_ACTIVE_TOTAL_REGIONS);
 
-    if (total == 0)
+    if (parsed < 0)
     {
-        ESP_EARLY_LOGE(TAG, "no regions parsed from '%s'",
+        ESP_EARLY_LOGE(TAG, "invalid DRAM region config '%s'",
                        CONFIG_MXR_REGION_CONFIG);
         return false;
     }
+    if (parsed == 0)
+    {
+        mxr_init_regions_temp_single();
+        return true; /* empty config intentionally means one flat region */
+    }
 
+    uint8_t total = (uint8_t)parsed;
     if (total == 1)
     {
         mxr_init_regions_temp_single();
@@ -4229,6 +4340,13 @@ static bool mxr_init_regions_kconfig(void)
         if (b < MXR_ALIGN_SIZE)
             b = MXR_ALIGN_SIZE;
         cfg[i].min_bytes = (mxr_class_t)b;
+    }
+
+    if ((uint32_t)cfg[0].min_bytes > MXR_ALIGN_SIZE)
+    {
+        ESP_EARLY_LOGE(TAG, "first DRAM region boundary must be <= %u",
+                       (unsigned)MXR_ALIGN_SIZE);
+        return false;
     }
 
     for (uint8_t i = 1; i < total; i++)
@@ -4300,7 +4418,7 @@ void mxr_init(void)
      * дескрипторов занимает хвост raw арены размером INIT*8 байт. */
     {
         uint32_t desc_bytes_init =
-            (uint32_t)MXR_DESC_INIT * (uint32_t)sizeof(mxr_desc_t);
+            (uint32_t)MXR_DRAM_DESC_INIT * (uint32_t)sizeof(mxr_desc_t);
         if ((uint32_t)bytes <= desc_bytes_init + 512u)
         {
             ESP_EARLY_LOGE(TAG, "heap arena too small for dynamic desc table");
@@ -4308,7 +4426,7 @@ void mxr_init(void)
         }
         bytes -= desc_bytes_init;
         s_dram_desc = (mxr_desc_t *)(start + bytes);
-        s_dram_desc_cap = MXR_DESC_INIT;
+        s_dram_desc_cap = MXR_DRAM_DESC_INIT;
     }
 #endif
 
@@ -4343,6 +4461,10 @@ void mxr_init(void)
 
 #ifdef CONFIG_MXR_USE_IRAM
     mxr_init_iram();
+    /* Dynamic IRAM descriptor capacity is known only after mxr_init_iram(),
+     * so publish the effective capacity now rather than leaving status at 0
+     * until the first table growth. */
+    s_stats.iram_desc_capacity = s_iram_desc_cap;
 #endif
 
     bool regions_ok = mxr_init_regions_kconfig();
@@ -4355,13 +4477,6 @@ void mxr_init(void)
     else
     {
         s_stats.region_init_fallback = false;
-    }
-
-    uint32_t largest_bytes = 0;
-    for (uint8_t i = 0; i < s_region_count; i++)
-    {
-        if (s_region[i].total_bytes > largest_bytes)
-            largest_bytes = s_region[i].total_bytes;
     }
 
     size_t total_bytes = s_arena_total_bytes;
@@ -4385,9 +4500,6 @@ void mxr_init(void)
         s_stats.iram_min_free_bytes = s_iram_total_bytes;
         s_stats.iram_fb_zone_total_bytes = s_iram_fb_zone_total;
         s_stats.iram_fb_region_count = s_iram_fb_region_count;
-        uint32_t iram_largest = mxr_iram_largest_free_zone_aware();
-        if (iram_largest > largest_bytes)
-            largest_bytes = iram_largest;
     }
 #endif
 
@@ -4396,7 +4508,13 @@ void mxr_init(void)
     s_stats.total_bytes = total_bytes;
     s_stats.free_bytes = free_bytes;
     s_stats.min_free_bytes = total_bytes;
-    s_stats.largest_free_block_bytes = (size_t)largest_bytes;
+    s_dram_fb_min_free_bytes = s_dram_free_bytes +
+#ifdef CONFIG_MXR_USE_IRAM
+        (s_iram_enabled ? s_iram_fb_free_bytes : 0u);
+#else
+        0u;
+#endif
+    s_stats.largest_free_block_bytes = mxr_get_largest_user_block_locked();
     s_initialized = true;
 
     ESP_EARLY_LOGD(TAG,
@@ -4410,7 +4528,7 @@ void mxr_init(void)
 /* ================================================================
  *  Status
  * ================================================================ */
-static void mxr_collect_status_locked(mxr_status_t *status)
+static void mxr_collect_status_locked(mxr_status_t *status, bool detailed)
 {
     if (!status)
         return;
@@ -4422,18 +4540,62 @@ static void mxr_collect_status_locked(mxr_status_t *status)
 
     size_t total_bytes = 0;
     size_t free_bytes = 0;
-    uint32_t largest_bytes = 0;
 
-    for (uint8_t i = 0; i < s_region_count; i++)
+    uint32_t total_gap_bytes = 0, gap_count = 0, sliver_count = 0;
+    uint32_t dram_largest = 0;
+    uint16_t cursor = 0;
+    /* Regions and descriptors are address-sorted, so each descriptor is
+     * visited once, not once per region. largest caches store RAW gaps. */
+    for (uint8_t r = 0; r < s_region_count; ++r)
     {
-        total_bytes += (size_t)s_region[i].total_bytes;
-        free_bytes += (size_t)s_region[i].free_bytes;
-        uint32_t lr = mxr_region_largest_free_bytes(i);
-        if (s_region[i].max_bytes != MXR_REGION_MAX_UNLIMITED &&
-            lr > (uint32_t)s_region[i].max_bytes)
-            lr = (uint32_t)s_region[i].max_bytes;
-        if (lr > largest_bytes)
-            largest_bytes = lr;
+        total_bytes += s_region[r].total_bytes;
+        free_bytes += s_region[r].free_bytes;
+        uint32_t cur = s_region[r].start_byte;
+        const uint32_t end = cur + s_region[r].total_bytes;
+        uint32_t raw_largest = 0;
+        while (cursor < s_dram_desc_count)
+        {
+            const mxr_desc_t *d = &s_dram_desc[cursor];
+            uint32_t off = mxr_desc_off(d);
+            uint32_t block_end = off + mxr_desc_len(d);
+            if (off >= end) break;
+            if (off > cur)
+            {
+                uint32_t gap = off - cur;
+                if (gap > raw_largest) raw_largest = gap;
+                if (detailed)
+                {
+                    total_gap_bytes += gap;
+                    ++gap_count;
+                    if (MXR_IS_SLIVER(gap)) ++sliver_count;
+                }
+            }
+            if (block_end > cur) cur = block_end;
+            ++cursor;
+        }
+        if (end > cur)
+        {
+            uint32_t gap = end - cur;
+            if (gap > raw_largest) raw_largest = gap;
+            if (detailed)
+            {
+                total_gap_bytes += gap;
+                ++gap_count;
+                if (MXR_IS_SLIVER(gap)) ++sliver_count;
+            }
+        }
+        s_region[r].largest_free_cache = raw_largest;
+        s_region[r].largest_cache_valid = 1;
+        if (raw_largest > dram_largest) dram_largest = raw_largest;
+    }
+    /* Public mxr_get_status always requests detailed=true. Minimal dump
+     * has a private snapshot and does not expose these skipped metrics. */
+    if (detailed)
+    {
+        s_stats.gap_count = gap_count;
+        s_stats.sliver_count = sliver_count;
+        s_stats.fragmentation_pct = total_gap_bytes > 0
+            ? ((total_gap_bytes - dram_largest) * 100u) / total_gap_bytes : 0;
     }
 
     s_stats.iram_total_bytes = 0;
@@ -4462,81 +4624,22 @@ static void mxr_collect_status_locked(mxr_status_t *status)
         s_stats.iram_exec_zone_total_bytes = mxr_iram_exec_zone_end();
         s_stats.iram_exec_zone_free_bytes = s_iram_exec_free_bytes;
         s_stats.iram_exec_zone_min_free_bytes = s_iram_exec_min_free_bytes;
-        uint32_t il = mxr_iram_largest_free_zone_aware();
-        if (il > largest_bytes)
-            largest_bytes = il;
     }
 #endif
 
     s_stats.total_bytes = total_bytes;
     s_stats.free_bytes = free_bytes;
 
-    s_stats.largest_free_block_bytes = (size_t)largest_bytes;
+    s_stats.largest_free_block_bytes = mxr_get_largest_user_block_locked();
     if (s_stats.free_bytes < s_stats.min_free_bytes)
         s_stats.min_free_bytes = s_stats.free_bytes;
 
-    /* НОВОЕ: метрики фрагментации DRAM */
-    {
-        uint32_t total_gap_bytes = 0;
-        uint32_t gap_count = 0;
-        uint32_t sliver_count = 0;
-        uint32_t dram_largest = 0;
-
-        for (uint8_t r = 0; r < s_region_count; r++)
-        {
-            uint32_t cur = s_region[r].start_byte;
-            uint32_t end = cur + (uint32_t)s_region[r].total_bytes;
-
-            for (uint16_t i = 0; i < s_dram_desc_count; i++)
-            {
-                uint32_t off = mxr_desc_off(&s_dram_desc[i]);
-                uint32_t len = mxr_desc_len(&s_dram_desc[i]);
-                uint32_t block_end = off + (uint32_t)len;
-
-                if (block_end <= s_region[r].start_byte)
-                    continue;
-                if (off >= end)
-                    break;
-
-                if (off > cur)
-                {
-                    uint32_t gap = (uint32_t)(off - cur);
-                    total_gap_bytes += gap;
-                    gap_count++;
-                    if (gap > dram_largest)
-                        dram_largest = gap;
-                    if (MXR_IS_SLIVER(gap))
-                        sliver_count++;
-                }
-                if (block_end > cur)
-                    cur = block_end;
-            }
-            if (end > cur)
-            {
-                uint32_t gap = (uint32_t)(end - cur);
-                total_gap_bytes += gap;
-                gap_count++;
-                if (gap > dram_largest)
-                    dram_largest = gap;
-                if (MXR_IS_SLIVER(gap))
-                    sliver_count++;
-            }
-        }
-
-        s_stats.gap_count = gap_count;
-        s_stats.sliver_count = sliver_count;
-        if (total_gap_bytes > 0 && dram_largest < total_gap_bytes)
-        {
-            /* FIX(1.5): 32-бит достаточно (значение <= arena_total * 100) */
-            s_stats.fragmentation_pct = ((total_gap_bytes - dram_largest) * 100u) / total_gap_bytes;
-        }
-        else
-        {
-            s_stats.fragmentation_pct = 0;
-        }
-    }
-
-    *status = s_stats;
+    /* FIX(#6): было `*status = s_stats` — при MXR_STATE_PLACEMENT=IRAM
+     * s_stats лежит в IRAM, и компилятор вправе сгенерировать вызов
+     * memcpy с 8/16-битными доступами (по одному исключению LoadStore
+     * на каждый доступ). sizeof(s_stats) утверждён кратным 4 в
+     * заголовке, поэтому копируем строго пословно. */
+    mxr_memcpy4(status, &s_stats, sizeof(s_stats));
 }
 
 static bool mxr_collect_region_status_locked(int region_index, mxr_region_status_t *status)
@@ -4636,51 +4739,73 @@ size_t mxr_get_min_free_size_caps(uint32_t caps)
     if (!s_initialized)
         return 0;
 
-    size_t bytes = 0;
-
     mxr_lock();
+    caps &= ~MXR_CAP_PREFER_IRAM;
 
-    for (uint8_t i = 0; i < s_region_count; i++)
+    /* Historical minimum: summing per-region minima is incorrect because
+     * different regions can reach their individual minima at different
+     * times. Return the minimum of the same aggregate pool used by
+     * mxr_get_free_size_caps_locked(). */
+    if (caps & MALLOC_CAP_EXEC)
     {
-        if (mxr_region_caps_ok(i, caps))
-            bytes += (size_t)s_region[i].min_free_bytes;
+#ifdef CONFIG_MXR_USE_IRAM
+        if (s_iram_enabled &&
+            (caps & ~((uint32_t)MALLOC_CAP_EXEC | (uint32_t)MALLOC_CAP_32BIT | (uint32_t)MALLOC_CAP_INTERNAL)) == 0)
+        {
+            const size_t bytes = s_iram_exec_min_free_bytes;
+            mxr_unlock();
+            return bytes;
+        }
+#endif
+        mxr_unlock();
+        return 0;
+    }
+
+    const uint32_t dram_caps = (uint32_t)MXR_DRAM_CAPS_DEFAULT;
+    const bool dram_matches = (caps & ~dram_caps) == 0;
+
+    /* 8BIT and/or DMA force DRAM even when 32BIT/INTERNAL is also present. */
+    if (dram_matches && caps != 0 &&
+        (caps & (MALLOC_CAP_8BIT | MALLOC_CAP_DMA)))
+    {
+        const size_t bytes = s_dram_min_free_bytes;
+        mxr_unlock();
+        return bytes;
     }
 
 #ifdef CONFIG_MXR_USE_IRAM
-    if (s_iram_enabled)
-    {
-        if (caps & MALLOC_CAP_EXEC)
-        {
-            if ((caps & ~(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) == 0)
-                bytes += (size_t)s_iram_exec_min_free_bytes;
-        }
 #ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
-        else if ((caps & MALLOC_CAP_32BIT) &&
-                 !(caps & (MALLOC_CAP_DMA | MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM)))
-        {
-            for (uint8_t i = 0; i < s_iram_fb_region_count; i++)
-                bytes += (size_t)s_iram_fb_region[i].min_free_bytes;
-        }
-        else if ((caps & MALLOC_CAP_INTERNAL) &&
-                 !(caps & (MALLOC_CAP_DMA | MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM)))
-        {
-            for (uint8_t i = 0; i < s_iram_fb_region_count; i++)
-                bytes += (size_t)s_iram_fb_region[i].min_free_bytes;
-        }
-        else if (caps == 0)
-        {
-            /* FIX(2.3): см. комментарий в mxr_get_free_size_caps()
-             * FIX(1.3): если fallback выключен, IRAM fb min_free не
-             * должен учитываться для 32BIT/caps==0. */
-            for (uint8_t i = 0; i < s_iram_fb_region_count; i++)
-                bytes += (size_t)s_iram_fb_region[i].min_free_bytes;
-        }
-#endif /* CONFIG_MXR_IRAM_FALLBACK_ENABLED */
+    if (s_iram_enabled &&
+        (caps & (MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) &&
+        !(caps & (MALLOC_CAP_DMA | MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM)))
+    {
+        const size_t bytes = s_dram_fb_min_free_bytes;
+        mxr_unlock();
+        return bytes;
     }
 #endif
+#endif
+
+    /* caps==0 is the non-EXEC pool exposed by the existing free-size query. */
+    if (caps == 0)
+    {
+        const size_t bytes = s_dram_fb_min_free_bytes;
+        mxr_unlock();
+        return bytes;
+    }
+
+    /* DRAM-only 32BIT/INTERNAL queries when IRAM fallback is disabled. */
+    if (dram_matches &&
+        (caps & (MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) &&
+        !(caps & (MALLOC_CAP_DMA | MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM)))
+    {
+        const size_t bytes = s_dram_min_free_bytes;
+        mxr_unlock();
+        return bytes;
+    }
 
     mxr_unlock();
-    return bytes;
+    return 0;
 }
 
 /* ================================================================
@@ -4696,57 +4821,288 @@ size_t mxr_get_total_size_caps(uint32_t caps)
     return bytes;
 }
 
-size_t mxr_get_largest_free_block_caps(uint32_t caps)
+static uint32_t MXR_IRAM_ATTR
+mxr_region_largest_free_bytes_bounded(uint8_t region_index, uint32_t end_cap)
 {
-    if (!s_initialized)
+    if (region_index >= s_region_count)
         return 0;
+
+    const uint32_t region_start = s_region[region_index].start_byte;
+    uint32_t region_end = region_start +
+                          (uint32_t)s_region[region_index].total_bytes;
+    if (end_cap < region_end)
+        region_end = end_cap;
+    if (region_end <= region_start)
+        return 0;
+
+    uint32_t cur = region_start;
     uint32_t largest = 0;
-    mxr_lock();
-    for (uint8_t i = 0; i < s_region_count; i++)
+    uint16_t start_idx = 0;
+#if MXR_DESC_BINARY_SEARCH_ACTIVE
+    start_idx = mxr_dram_desc_first_after(region_start);
+#endif
+    for (uint16_t i = start_idx; i < s_dram_desc_count; ++i)
     {
-        if (!mxr_region_caps_ok(i, caps))
+        const uint32_t off = mxr_desc_off(&s_dram_desc[i]);
+        const uint32_t len = mxr_desc_len(&s_dram_desc[i]);
+        const uint32_t block_end = off + len;
+        if (block_end <= region_start)
             continue;
-        uint32_t lr = mxr_region_largest_free_bytes(i);
-        if (s_region[i].max_bytes != MXR_REGION_MAX_UNLIMITED &&
-            lr > (uint32_t)s_region[i].max_bytes)
-            lr = (uint32_t)s_region[i].max_bytes;
-        if (lr > largest)
-            largest = lr;
+        if (off >= region_end)
+            break;
+        if (off > cur && off - cur > largest)
+            largest = off - cur;
+        if (block_end > cur)
+            cur = block_end;
+        if (cur >= region_end)
+            break;
     }
+    if (region_end > cur && region_end - cur > largest)
+        largest = region_end - cur;
+    return largest;
+}
+
 #ifdef CONFIG_MXR_USE_IRAM
-    if (s_iram_enabled)
+#ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
+#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+static uint32_t MXR_IRAM_ATTR
+mxr_iram_fb_region_largest_free_bounded(int reg, uint32_t end_cap)
+{
+    if (reg < 0 || reg >= (int)s_iram_fb_region_count)
+        return 0;
+
+    const uint32_t reg_start = s_iram_fb_region[reg].start_byte;
+    uint32_t reg_end = mxr_iram_fb_region_end(reg);
+    if (end_cap < reg_end)
+        reg_end = end_cap;
+    if (reg_end <= reg_start)
+        return 0;
+
+    uint32_t cur = reg_start;
+    uint32_t largest = 0;
+    uint16_t start_idx = 0;
+#if MXR_DESC_BINARY_SEARCH_ACTIVE
+    start_idx = mxr_iram_desc_first_after(reg_start);
+#endif
+    for (uint16_t i = start_idx; i < s_iram_desc_count; ++i)
+    {
+        const uint32_t off = mxr_desc_off(&s_iram_desc[i]);
+        const uint32_t len = mxr_desc_len(&s_iram_desc[i]);
+        const uint32_t block_end = off + len;
+        if (block_end <= reg_start)
+            continue;
+        if (off >= reg_end)
+            break;
+        if (off > cur && off - cur > largest)
+            largest = off - cur;
+        if (block_end > cur)
+            cur = block_end;
+        if (cur >= reg_end)
+            break;
+    }
+    if (reg_end > cur && reg_end - cur > largest)
+        largest = reg_end - cur;
+    return largest;
+}
+#endif
+#endif
+#endif
+
+static size_t mxr_get_largest_free_block_caps_locked(uint32_t caps)
+{
+    uint32_t largest_user = 0;
+    caps &= ~MXR_CAP_PREFER_IRAM;
+
+    bool dram_desc_available = s_dram_desc_count < s_dram_desc_cap;
+#if MXR_DESC_DYNAMIC_ACTIVE
+    uint32_t dram_last_end_cap = s_arena_total_bytes;
+    if (!dram_desc_available && mxr_dram_table_can_grow_for(0, 0))
+    {
+        dram_desc_available = true;
+        dram_last_end_cap = s_arena_total_bytes -
+            (uint32_t)MXR_DESC_CHUNK * (uint32_t)sizeof(mxr_desc_t);
+    }
+#else
+    const uint32_t dram_last_end_cap = s_arena_total_bytes;
+#endif
+
+    if (dram_desc_available)
+    {
+        for (uint8_t i = 0; i < s_region_count; i++)
+        {
+            if (!mxr_region_caps_ok(i, caps))
+                continue;
+            uint32_t raw_gap = mxr_region_largest_free_bytes_bounded(
+                i, (i == (uint8_t)(s_region_count - 1)) ? dram_last_end_cap :
+                    s_region[i].start_byte + (uint32_t)s_region[i].total_bytes);
+            uint32_t candidate = mxr_largest_user_block_in_gap(
+                raw_gap,
+                (uint32_t)s_region[i].min_bytes,
+                (uint32_t)s_region[i].max_bytes,
+                0);
+            if (candidate > largest_user)
+                largest_user = candidate;
+        }
+
+#if defined(CONFIG_MXR_CROSS_REGION_FALLBACK) && defined(CONFIG_MXR_DRAM_CROSS_ENABLED)
+        /* Cross-region placement may exceed a target region's own class
+         * maximum, but only as far as the configured guard permits. */
+        for (uint8_t i = 0; i < s_region_count; i++)
+        {
+            if (!mxr_region_caps_ok(i, caps))
+                continue;
+            uint32_t min_internal = MXR_ALIGN_SIZE;
+#ifdef MXR_DRAM_MIN_BYTES_DIVISOR
+            uint32_t guard_min =
+                (uint32_t)s_region[i].min_bytes / MXR_DRAM_MIN_BYTES_DIVISOR;
+            if (guard_min > min_internal)
+                min_internal = guard_min;
+#endif
+            uint32_t guard_max = 0;
+#ifdef MXR_DRAM_GUARD_NUM
+            if (s_region[i].max_bytes != MXR_REGION_MAX_UNLIMITED)
+            {
+                uint32_t max_bytes = (uint32_t)s_region[i].max_bytes;
+                const uint32_t q = max_bytes / (uint32_t)MXR_DRAM_GUARD_DEN;
+                const uint32_t rem = max_bytes % (uint32_t)MXR_DRAM_GUARD_DEN;
+                guard_max = q * (uint32_t)MXR_DRAM_GUARD_NUM +
+                    (rem * (uint32_t)MXR_DRAM_GUARD_NUM) /
+                    (uint32_t)MXR_DRAM_GUARD_DEN;
+                if (guard_max == 0)
+                    continue;
+            }
+#endif
+            uint32_t candidate = mxr_largest_user_block_in_gap(
+                mxr_region_largest_free_bytes_bounded(
+                    i, (i == (uint8_t)(s_region_count - 1)) ? dram_last_end_cap :
+                        s_region[i].start_byte + (uint32_t)s_region[i].total_bytes),
+                min_internal, 0, guard_max);
+            if (candidate > largest_user)
+                largest_user = candidate;
+        }
+#endif
+    }
+
+#ifdef CONFIG_MXR_USE_IRAM
+    bool iram_desc_available = s_iram_desc_count < s_iram_desc_cap;
+#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+    uint32_t iram_last_end_cap = s_iram_total_bytes;
+    if (!iram_desc_available && mxr_iram_table_can_grow_for(0, 0))
+    {
+        iram_desc_available = true;
+        iram_last_end_cap = s_iram_total_bytes -
+            (uint32_t)MXR_DESC_CHUNK * (uint32_t)sizeof(mxr_desc_t);
+    }
+#endif
+    if (s_iram_enabled && iram_desc_available)
     {
         if (caps & MALLOC_CAP_EXEC)
         {
-            if ((caps & ~(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) == 0)
+            if ((caps & ~((uint32_t)MALLOC_CAP_EXEC | (uint32_t)MALLOC_CAP_32BIT | (uint32_t)MALLOC_CAP_INTERNAL)) == 0)
             {
-                uint32_t lr = mxr_iram_exec_largest_free();
-                if (lr > largest)
-                    largest = lr;
+                uint32_t candidate = mxr_largest_user_block_from_internal(
+                    mxr_iram_exec_largest_free());
+                if (candidate > largest_user)
+                    largest_user = candidate;
             }
         }
 #ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
-        else if (((caps & MALLOC_CAP_32BIT) &&
-                  !(caps & (MALLOC_CAP_DMA | MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM))) ||
-                 ((caps & MALLOC_CAP_INTERNAL) &&
-                  !(caps & (MALLOC_CAP_DMA | MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM))) ||
-                 caps == 0)
+        else if (mxr_caps_allow_iram_fallback(caps))
         {
+            uint32_t policy_max = (uint32_t)CONFIG_MXR_IRAM_FALLBACK_MAX_BYTES;
             for (uint8_t i = 0; i < s_iram_fb_region_count; i++)
             {
-                uint32_t lr = mxr_iram_fb_region_largest_free((int)i);
-                if (s_iram_fb_region[i].max_bytes != MXR_REGION_MAX_UNLIMITED &&
-                    lr > (uint32_t)s_iram_fb_region[i].max_bytes)
-                    lr = (uint32_t)s_iram_fb_region[i].max_bytes;
-                if (lr > largest)
-                    largest = lr;
+                uint32_t fb_gap = mxr_iram_fb_region_largest_free((int)i);
+#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+                if (i == (uint8_t)(s_iram_fb_region_count - 1) &&
+                    iram_last_end_cap < mxr_iram_fb_region_end((int)i))
+                {
+                    fb_gap = mxr_iram_fb_region_largest_free_bounded(
+                        (int)i, iram_last_end_cap);
+                }
+#endif
+                uint32_t candidate = mxr_largest_user_block_in_gap(
+                    fb_gap,
+                    (uint32_t)s_iram_fb_region[i].min_bytes,
+                    (uint32_t)s_iram_fb_region[i].max_bytes,
+                    policy_max);
+                if (candidate > largest_user)
+                    largest_user = candidate;
             }
+
+#if defined(CONFIG_MXR_CROSS_REGION_FALLBACK) && defined(CONFIG_MXR_IRAM_CROSS_ENABLED)
+            for (uint8_t i = 0; i < s_iram_fb_region_count; i++)
+            {
+                uint32_t min_internal = MXR_ALIGN_SIZE;
+#ifdef MXR_IRAM_MIN_BYTES_DIVISOR
+                uint32_t guard_min =
+                    (uint32_t)s_iram_fb_region[i].min_bytes / MXR_IRAM_MIN_BYTES_DIVISOR;
+                if (guard_min > min_internal)
+                    min_internal = guard_min;
+#endif
+                uint32_t guard_max = policy_max;
+#ifdef MXR_IRAM_GUARD_NUM
+                if (s_iram_fb_region[i].max_bytes != MXR_REGION_MAX_UNLIMITED)
+                {
+                    uint32_t max_bytes = (uint32_t)s_iram_fb_region[i].max_bytes;
+                    const uint32_t q = max_bytes / (uint32_t)MXR_IRAM_GUARD_DEN;
+                    const uint32_t rem = max_bytes % (uint32_t)MXR_IRAM_GUARD_DEN;
+                    uint32_t class_guard =
+                        q * (uint32_t)MXR_IRAM_GUARD_NUM +
+                        (rem * (uint32_t)MXR_IRAM_GUARD_NUM) /
+                        (uint32_t)MXR_IRAM_GUARD_DEN;
+                    if (class_guard == 0)
+                        continue;
+                    if (guard_max == 0 || class_guard < guard_max)
+                        guard_max = class_guard;
+                }
+#endif
+                uint32_t fb_gap = mxr_iram_fb_region_largest_free((int)i);
+#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+                if (i == (uint8_t)(s_iram_fb_region_count - 1) &&
+                    iram_last_end_cap < mxr_iram_fb_region_end((int)i))
+                {
+                    fb_gap = mxr_iram_fb_region_largest_free_bounded(
+                        (int)i, iram_last_end_cap);
+                }
+#endif
+                uint32_t candidate = mxr_largest_user_block_in_gap(
+                    fb_gap, min_internal, 0, guard_max);
+                if (candidate > largest_user)
+                    largest_user = candidate;
+            }
+#endif
         }
 #endif /* CONFIG_MXR_IRAM_FALLBACK_ENABLED */
     }
 #endif /* CONFIG_MXR_USE_IRAM */
-    mxr_unlock();
+
+    return (size_t)largest_user;
+}
+
+static size_t mxr_get_largest_user_block_locked(void)
+{
+    uint32_t largest = (uint32_t)mxr_get_largest_free_block_caps_locked(0);
+#ifdef CONFIG_MXR_USE_IRAM
+    if (s_iram_enabled && s_iram_desc_count < (uint32_t)CONFIG_MXR_IRAM_MAX_DESC)
+    {
+        uint32_t exec_largest = mxr_largest_user_block_from_internal(
+            mxr_iram_exec_largest_free());
+        if (exec_largest > largest)
+            largest = exec_largest;
+    }
+#endif
     return (size_t)largest;
+}
+
+size_t mxr_get_largest_free_block_caps(uint32_t caps)
+{
+    if (!s_initialized)
+        return 0;
+    mxr_lock();
+    size_t largest = mxr_get_largest_free_block_caps_locked(caps);
+    mxr_unlock();
+    return largest;
 }
 
 /* ================================================================
@@ -4765,7 +5121,7 @@ static size_t mxr_get_total_size_caps_locked(uint32_t caps)
     {
         if (caps & MALLOC_CAP_EXEC)
         {
-            if ((caps & ~(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) == 0)
+            if ((caps & ~((uint32_t)MALLOC_CAP_EXEC | (uint32_t)MALLOC_CAP_32BIT | (uint32_t)MALLOC_CAP_INTERNAL)) == 0)
                 bytes += (size_t)mxr_iram_exec_zone_end();
         }
 #ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
@@ -4802,7 +5158,7 @@ static size_t mxr_get_free_size_caps_locked(uint32_t caps)
     {
         if (caps & MALLOC_CAP_EXEC)
         {
-            if ((caps & ~(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL)) == 0)
+            if ((caps & ~((uint32_t)MALLOC_CAP_EXEC | (uint32_t)MALLOC_CAP_32BIT | (uint32_t)MALLOC_CAP_INTERNAL)) == 0)
                 bytes += (size_t)s_iram_exec_free_bytes;
         }
 #ifdef CONFIG_MXR_IRAM_FALLBACK_ENABLED
@@ -4847,6 +5203,7 @@ void mxr_dump(void)
 {
     mxr_status_t st;
 
+#if defined(CONFIG_MXR_DUMP_NORMAL) || defined(CONFIG_MXR_DUMP_FULL)
     static mxr_region_status_t rs[MXR_ACTIVE_TOTAL_REGIONS];
     static bool rs_ok[MXR_ACTIVE_TOTAL_REGIONS];
 
@@ -4866,6 +5223,8 @@ void mxr_dump(void)
     uint32_t iram_free;
     uint32_t iram_min_free;
 #endif
+
+#endif /* detailed dump locals */
 
 #if defined(CONFIG_MXR_DUMP_FULL)
     mxr_desc_t *dram_snap = NULL;
@@ -4913,7 +5272,8 @@ void mxr_dump(void)
     /* ===================== atomic snapshot ===================== */
     mxr_lock();
 
-    mxr_collect_status_locked(&st);
+#if defined(CONFIG_MXR_DUMP_NORMAL) || defined(CONFIG_MXR_DUMP_FULL)
+    mxr_collect_status_locked(&st, true);
 
     for (uint8_t i = 0; i < MXR_ACTIVE_TOTAL_REGIONS; i++)
         rs_ok[i] = mxr_collect_region_status_locked((int)i, &rs[i]);
@@ -4934,6 +5294,10 @@ void mxr_dump(void)
     iram_free = s_iram_free_bytes;
     iram_min_free = s_iram_min_free_bytes;
 #endif
+
+#else
+    mxr_collect_status_locked(&st, false);
+#endif /* detailed snapshots */
 
 #if defined(CONFIG_MXR_DUMP_FULL)
     if (dram_snap)
@@ -4972,6 +5336,10 @@ void mxr_dump(void)
                    (unsigned)st.free_bytes,
                    (unsigned)st.min_free_bytes,
                    (unsigned)st.largest_free_block_bytes);
+
+    if (st.canary_violations || st.double_free_detects)
+        ESP_EARLY_LOGW(TAG, "deferred heap errors: canary=%u double_free=%u",
+                       (unsigned)st.canary_violations, (unsigned)st.double_free_detects);
 
 #if defined(CONFIG_MXR_DUMP_NORMAL) || defined(CONFIG_MXR_DUMP_FULL)
 
@@ -5165,7 +5533,7 @@ void mxr_get_status(mxr_status_t *status)
         return;
 
     mxr_lock();
-    mxr_collect_status_locked(status);
+    mxr_collect_status_locked(status, true);
     mxr_unlock();
 }
 

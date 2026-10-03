@@ -229,6 +229,17 @@ extern "C"
 #endif
 #ifdef CONFIG_MXR_DESC_DYNAMIC
 #define MXR_DESC_DYNAMIC_ACTIVE 1
+#else
+#define MXR_DESC_DYNAMIC_ACTIVE 0
+#endif
+
+/* FIX(#21): INIT/CHUNK общие для DRAM- и IRAM-динамики. Раньше они
+ * объявлялись только под CONFIG_MXR_DESC_DYNAMIC, и отдельное включение
+ * CONFIG_MXR_IRAM_DESC_DYNAMIC (допустимая по Kconfig комбинация)
+ * оставляло IRAM-код с неопределёнными макросами. */
+#if MXR_DESC_DYNAMIC_ACTIVE || \
+    (defined(CONFIG_MXR_USE_IRAM) && defined(CONFIG_MXR_IRAM_FALLBACK_ENABLED) && \
+     defined(CONFIG_MXR_IRAM_DESC_DYNAMIC))
 #ifndef CONFIG_MXR_DESC_INIT
 #define CONFIG_MXR_DESC_INIT 32
 #endif
@@ -237,12 +248,9 @@ extern "C"
 #endif
 #define MXR_DESC_INIT CONFIG_MXR_DESC_INIT
 #define MXR_DESC_CHUNK CONFIG_MXR_DESC_CHUNK
-#else
-#define MXR_DESC_DYNAMIC_ACTIVE 0
 #endif
-#if MXR_DESC_DYNAMIC_ACTIVE && (MXR_DESC_INIT > CONFIG_MXR_MAX_DESC)
-#undef MXR_DESC_INIT
-#define MXR_DESC_INIT CONFIG_MXR_MAX_DESC
+#if MXR_DESC_DYNAMIC_ACTIVE
+#define MXR_DRAM_DESC_INIT ((MXR_DESC_INIT < CONFIG_MXR_MAX_DESC) ? MXR_DESC_INIT : CONFIG_MXR_MAX_DESC)
 #endif
 
 #if defined(CONFIG_MXR_USE_IRAM) && defined(CONFIG_MXR_IRAM_FALLBACK_ENABLED) && \
@@ -257,9 +265,20 @@ extern "C"
 #if MXR_IRAM_DESC_DYNAMIC_ACTIVE && !defined(CONFIG_MXR_IRAM_FALLBACK_ENABLED)
 #error "MXR_IRAM_DESC_DYNAMIC requires CONFIG_MXR_IRAM_FALLBACK_ENABLED (fb region owns the arena tail)"
 #endif
-#if MXR_IRAM_DESC_DYNAMIC_ACTIVE && (MXR_DESC_INIT > CONFIG_MXR_IRAM_MAX_DESC)
-#undef MXR_DESC_INIT
-#define MXR_DESC_INIT CONFIG_MXR_IRAM_MAX_DESC
+#if MXR_IRAM_DESC_DYNAMIC_ACTIVE
+#define MXR_IRAM_DESC_INIT ((MXR_DESC_INIT < CONFIG_MXR_IRAM_MAX_DESC) ? MXR_DESC_INIT : CONFIG_MXR_IRAM_MAX_DESC)
+#endif
+#if MXR_DESC_DYNAMIC_ACTIVE || MXR_IRAM_DESC_DYNAMIC_ACTIVE
+#if MXR_DESC_INIT < 1 || MXR_DESC_CHUNK < 1 || MXR_DESC_CHUNK > 4096
+#error "Dynamic descriptors require INIT >= 1 and CHUNK in 1..4096"
+#endif
+#endif
+
+/* FIX(#19): отрицательный Kconfig-int без range (например BIG_GAP_MIN=-1)
+ * после приведения к uint32_t превращался в огромный порог. Ручные сборки
+ * без menuconfig-валидации теперь падают здесь, а не на устройстве. */
+#if defined(CONFIG_MXR_BIG_GAP_MIN) && (CONFIG_MXR_BIG_GAP_MIN < 0)
+#error "CONFIG_MXR_BIG_GAP_MIN must be >= 0"
 #endif
 
 /* ================================================================
@@ -442,6 +461,13 @@ typedef uint32_t mxr_count_t;
 #define MALLOC_CAP_INTERNAL (1 << 11)
 #endif
 
+/* Ordinary malloc family only; explicit caps and SDK heap queries are unchanged. */
+#ifdef CONFIG_MXR_DEFAULT_DRAM_ONLY
+#define MXR_DEFAULT_CAPS (MALLOC_CAP_8BIT | MALLOC_CAP_32BIT)
+#else
+#define MXR_DEFAULT_CAPS MALLOC_CAP_32BIT
+#endif
+
 /* ================================================================
  *  MxR extension: placement hint "prefer IRAM"
  *
@@ -471,7 +497,7 @@ typedef uint32_t mxr_count_t;
 #if defined(CONFIG_MXR_DESC_IN_IRAM_TEXT)
 #define MXR_IRAM_DATA_ATTR __attribute__((section(".iram0.text"), aligned(4)))
 #elif defined(CONFIG_MXR_DESC_IN_IRAM_BSS)
-#define MXR_IRAM_DATA_ATTR __attribute__((section(".iram0.bss"), aligned(4)))
+#define MXR_IRAM_DATA_ATTR __attribute__((section(".bss.mxriram"), aligned(4)))
 #else
 #define MXR_IRAM_DATA_ATTR
 #endif
@@ -553,7 +579,7 @@ typedef uint32_t mxr_count_t;
     mxr_class_t max_bytes;
     uint32_t free_bytes;
     uint32_t min_free_bytes;
-    uint32_t largest_free_bytes;
+    uint32_t largest_free_bytes; /* largest raw internal gap, class-limited */
     mxr_count_t alloc_count;
   } mxr_region_status_t;
 
@@ -573,7 +599,7 @@ typedef uint32_t mxr_count_t;
     size_t total_bytes;
     size_t free_bytes;
     size_t min_free_bytes;
-    size_t largest_free_block_bytes;
+    size_t largest_free_block_bytes; /* largest allocatable user payload estimate */
     size_t iram_total_bytes;
     size_t iram_free_bytes;
     size_t iram_min_free_bytes;
@@ -735,6 +761,7 @@ typedef uint32_t mxr_count_t;
   bool mxr_get_iram_fb_region_status(int region_index, mxr_region_status_t *status);
   void mxr_dump(void);
   size_t mxr_get_total_size_caps(uint32_t caps);
+  /* Maximum user payload estimate for current qualifying gaps. Not a reservation. */
   size_t mxr_get_largest_free_block_caps(uint32_t caps);
   size_t mxr_get_allocated_size_caps(uint32_t caps);
 

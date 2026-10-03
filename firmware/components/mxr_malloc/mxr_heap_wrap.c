@@ -1,4 +1,4 @@
-﻿#include "mxr_malloc.h"
+#include "mxr_malloc.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "esp_attr.h"
@@ -111,12 +111,12 @@ size_t __wrap_heap_caps_get_largest_free_block(uint32_t caps)
 #ifdef CONFIG_MXR_WRAP_DEFAULT_POOL
 void *MXR_WRAP_ALLOC_ATTR __wrap_heap_caps_malloc_default(size_t size)
 {
-    return mxr_malloc_caps(size, MALLOC_CAP_32BIT);
+    return mxr_malloc_caps(size, MXR_DEFAULT_CAPS);
 }
 
 void *MXR_WRAP_ALLOC_ATTR __wrap_heap_caps_realloc_default(void *ptr, size_t size)
 {
-    return mxr_realloc_caps(ptr, size, MALLOC_CAP_32BIT);
+    return mxr_realloc_caps(ptr, size, MXR_DEFAULT_CAPS);
 }
 #endif /* CONFIG_MXR_WRAP_DEFAULT_POOL */
 
@@ -146,7 +146,7 @@ size_t __wrap_esp_get_free_internal_heap_size(void)
 #ifdef CONFIG_MXR_WRAP_LIBC
 void *MXR_WRAP_IRAM __wrap_malloc(size_t n)
 {
-    return mxr_malloc_caps(n, MALLOC_CAP_32BIT);
+    return mxr_malloc_caps(n, MXR_DEFAULT_CAPS);
 }
 
 void MXR_WRAP_IRAM __wrap_free(void *ptr)
@@ -156,16 +156,16 @@ void MXR_WRAP_IRAM __wrap_free(void *ptr)
 
 void *MXR_WRAP_ALLOC_ATTR __wrap_calloc(size_t c, size_t s)
 {
-    return mxr_calloc_caps(c, s, MALLOC_CAP_32BIT);
+    return mxr_calloc_caps(c, s, MXR_DEFAULT_CAPS);
 }
 
 void *MXR_WRAP_ALLOC_ATTR __wrap_realloc(void *old_ptr, size_t n)
 {
-    return mxr_realloc_caps(old_ptr, n, MALLOC_CAP_32BIT);
+    return mxr_realloc_caps(old_ptr, n, MXR_DEFAULT_CAPS);
 }
 
 void *MXR_WRAP_ALLOC_ATTR __wrap_zalloc(size_t n)
 {
-    return mxr_zalloc_caps(n, MALLOC_CAP_32BIT);
+    return mxr_zalloc_caps(n, MXR_DEFAULT_CAPS);
 }
 #endif /* CONFIG_MXR_WRAP_LIBC */

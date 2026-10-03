@@ -86,15 +86,13 @@ menu "MxR-Malloc"
             the IRAM usage of your firmware.
 
     config MXR_DESC_IN_IRAM_BSS
-        bool "IRAM (.iram0.bss) - requires patched linker script"
+        bool "IRAM (.iram0.bss) - automatic SDK linker mapping"
         help
-            Place descriptor tables into the .iram0.bss section.
-
-            This is cleaner than .iram0.text for data, but ESP8266
-            linker scripts usually do not define .iram0.bss by default.
-
-            Use this only if you have a patched linker script that
-            properly defines and reserves the .iram0.bss section.
+            Place descriptor tables in a dedicated input section mapped
+            into the SDK .iram0.bss output by ld/mxr_sections.lf.
+            No SDK script patch is needed with the component CMake build.
+            Custom build systems must apply the same mapping and ensure
+            _iram_end is beyond all allocator state. See docs/VALIDATION.md.
 
     endchoice
 
@@ -329,6 +327,21 @@ menu "MxR-Malloc"
             Disable this if you do not need IRAM for data and want to
             avoid the risk of byte/half-word accesses to IRAM memory.
 
+    config MXR_DEFAULT_DRAM_ONLY
+        bool "Keep ordinary malloc/calloc/realloc/zalloc in byte-addressable DRAM"
+        default y
+        help
+            If enabled, ordinary MxR, libc and default-pool wrappers request
+            8BIT | 32BIT memory. This is the safe default because arbitrary
+            libc callers may legally perform byte accesses. Explicit
+            capability requests are unchanged.
+            If disabled, preserve ESP8266 RTOS SDK's 32BIT default policy,
+            which may allow IRAM fallback and byte-access emulation.
+            Disable only when every ordinary allocation is known to be
+            32-bit-access-only.
+            esp_get_free_heap_size keeps SDK semantics (32BIT total);
+            use an explicit 8BIT or DRAM query for byte-addressable capacity.
+
     config MXR_IRAM_FALLBACK_MAX_BYTES
         int "Maximum block size for IRAM fallback"
         depends on MXR_USE_IRAM && MXR_IRAM_FALLBACK_ENABLED
@@ -336,7 +349,8 @@ menu "MxR-Malloc"
         default 0
         help
             Maximum size of a non-EXEC block that is allowed to be
-            placed into IRAM.
+            placed into IRAM, including alignment, canaries and anti-sliver
+            expansion.
 
             Set this to prevent large non-executable buffers from
             consuming IRAM.
@@ -917,10 +931,12 @@ menu "MxR-Malloc"
             a 4-byte tail canary written on every successful allocation
             and checked on free()/realloc().
 
-            On violation the allocator logs the block offset/length and
-            SKIPS the free (the block leaks, but the heap stays
-            consistent and the evidence block is preserved). Counter:
-            mxr_get_status().canary_violations.
+            On violation the allocator quarantines the block and SKIPS
+            the free (the block leaks, but the heap stays consistent and
+            the evidence block is preserved). It increments
+            mxr_get_status().canary_violations; it does not log from the
+            allocator critical section. Call mxr_dump() later, with normal
+            logging available, to see deferred error counters.
 
             Overhead: +8 B per block (higher memory usage; on small
             blocks ~+30%).
@@ -932,8 +948,10 @@ menu "MxR-Malloc"
             Keeps a small FIFO ring of the most recently freed blocks
             (offset + length + arena). A free() whose descriptor is not
             found but whose offset matches a ring entry is classified
-            as a double-free: it is logged, counted
-            (mxr_get_status().double_free_detects) and skipped.
+            as a double-free, counted in
+            mxr_get_status().double_free_detects and skipped. No
+            per-event log is emitted while the allocator lock is held;
+            mxr_dump() can report the deferred counter later.
 
             A stale pointer reused via realloc() cannot be detected
             with plain pointers; combine with block canaries for the
@@ -987,6 +1005,7 @@ menu "MxR-Malloc"
         int "Big-gap guard: minimum gap size guarded (bytes)"
         depends on MXR_BIG_GAP_GUARD
         default 1024
+        range 0 2147483647
         help
             Absolute threshold protecting gaps regardless of the
             request size.
@@ -1017,21 +1036,24 @@ menu "MxR-Malloc"
 
     config MXR_DESC_INIT
         int "Dynamic tables: initial capacity (descriptors)"
-        depends on MXR_DESC_DYNAMIC
+        depends on MXR_DESC_DYNAMIC || MXR_IRAM_DESC_DYNAMIC
         default 32
         range 4 1024
         help
             Initial number of descriptor slots carved from the heap
-            tail (also the minimum it shrinks back to).
+            tail (also the minimum it shrinks back to). Shared by the
+            DRAM and IRAM fallback dynamic tables: the effective initial
+            capacity is clamped to each table's own MAX_DESC ceiling.
 
     config MXR_DESC_CHUNK
         int "Dynamic tables: grow/shrink chunk (descriptors)"
-        depends on MXR_DESC_DYNAMIC
+        depends on MXR_DESC_DYNAMIC || MXR_IRAM_DESC_DYNAMIC
         default 16
         range 4 256
         help
             Step for growing (and shrinking, with a 2-chunk hysteresis).
             Each chunk costs CHUNK*sizeof(descriptor) bytes of heap.
+            Shared by the DRAM and IRAM fallback dynamic tables.
 
     config MXR_IRAM_DESC_DYNAMIC
         bool "Dynamic descriptor table for IRAM fallback heap"

@@ -1,4 +1,4 @@
-﻿#include "mxr_malloc.h"
+#include "mxr_malloc.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -85,12 +85,12 @@ size_t heap_caps_get_dram_free_size(void)
 
 void *MXR_COMPAT_ALLOC_ATTR heap_caps_malloc_default(size_t size)
 {
-    return mxr_malloc_caps(size, MALLOC_CAP_32BIT);
+    return mxr_malloc_caps(size, MXR_DEFAULT_CAPS);
 }
 
 void *MXR_COMPAT_ALLOC_ATTR heap_caps_realloc_default(void *ptr, size_t size)
 {
-    return mxr_realloc_caps(ptr, size, MALLOC_CAP_32BIT);
+    return mxr_realloc_caps(ptr, size, MXR_DEFAULT_CAPS);
 }
 /* FIX(2.3): дополнительные query API */
 size_t heap_caps_get_total_size(uint32_t caps)

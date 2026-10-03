@@ -1,0 +1,14 @@
+# Unique input section: handled by SDK startup's [_iram_bss_start,_iram_bss_end).
+# Does not need an additional project script or SDK modification.
+[sections:mxr_iram_state]
+entries:
+    .bss.mxriram+
+
+[scheme:mxr_iram_state]
+entries:
+    mxr_iram_state -> iram0_bss
+
+[mapping:mxr_iram_state]
+archive: libmxr_malloc.a
+entries:
+    * (mxr_iram_state)

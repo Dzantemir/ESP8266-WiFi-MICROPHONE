@@ -1,6 +1,10 @@
-﻿#include "mxr_malloc.h"
+#include "mxr_malloc.h"
 
+#include <stdlib.h>
 #include <stddef.h>
+
+/* SDK extension, not part of ISO C stdlib.h. */
+void *zalloc(size_t n);
 #include <stdint.h>
 
 /*
@@ -11,7 +15,7 @@
 void *malloc(size_t n)
 {
     void *ra = (void *)__builtin_return_address(0);
-    return _heap_caps_malloc(n, MALLOC_CAP_32BIT, (const char *)ra, 0);
+    return _heap_caps_malloc(n, MXR_DEFAULT_CAPS, (const char *)ra, 0);
 }
 
 void free(void *ptr)
@@ -23,17 +27,17 @@ void free(void *ptr)
 void *calloc(size_t c, size_t s)
 {
     void *ra = (void *)__builtin_return_address(0);
-    return _heap_caps_calloc(c, s, MALLOC_CAP_32BIT, (const char *)ra, 0);
+    return _heap_caps_calloc(c, s, MXR_DEFAULT_CAPS, (const char *)ra, 0);
 }
 
 void *realloc(void *old_ptr, size_t n)
 {
     void *ra = (void *)__builtin_return_address(0);
-    return _heap_caps_realloc(old_ptr, n, MALLOC_CAP_32BIT, (const char *)ra, 0);
+    return _heap_caps_realloc(old_ptr, n, MXR_DEFAULT_CAPS, (const char *)ra, 0);
 }
 
 void *zalloc(size_t n)
 {
     void *ra = (void *)__builtin_return_address(0);
-    return _heap_caps_zalloc(n, MALLOC_CAP_32BIT, (const char *)ra, 0);
+    return _heap_caps_zalloc(n, MXR_DEFAULT_CAPS, (const char *)ra, 0);
 }
