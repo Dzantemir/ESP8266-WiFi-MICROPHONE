@@ -1436,8 +1436,8 @@ static void cmd_status_impl(void)
     svc_port_status_t st;
     svc_port_get_status(&st);
 
-    extern void mxr_dump(void);
-    mxr_dump();
+  //  extern void mxr_dump(void);
+   // mxr_dump();
 
     at_send_data("+STATUS:firmware=" FIRMWARE_VERSION "\r\n");
     at_send_data("+STATUS:wifi_ssid=\"%s\"\r\n", cfg.wifi_ssid);
